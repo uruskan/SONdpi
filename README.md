@@ -15,14 +15,14 @@
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6">
   <img alt="Dil" src="https://img.shields.io/badge/dil-Rust-b7410e">
   <img alt="Lisans" src="https://img.shields.io/badge/lisans-MIT-2ea44f">
-  <img alt="Testler" src="https://img.shields.io/badge/birim%20testi-124%20ge%C3%A7iyor-2ea44f">
+  <img alt="Testler" src="https://img.shields.io/badge/birim%20testi-131%20ge%C3%A7iyor-2ea44f">
   <img alt="Sürüm" src="https://img.shields.io/github/v/release/uruskan/SONdpi?include_prereleases&label=s%C3%BCr%C3%BCm">
   <img alt="Terminal" src="https://img.shields.io/badge/terminal-gerekmez-8250df">
   <img alt="Baba" src="https://img.shields.io/badge/babayla-yar%C4%B1%C5%9F%C4%B1lmaz-ff69b4">
 </p>
 
 > [!WARNING]
-> **Erken sürüm.** Motor 124 birim testinden geçiyor ve Turkcell 5G ev internetinde sınandı ([sonuçlar aşağıda](#sondpi-bu-hatta-ne-yaptı)). Kurulum, servis, anahtar ve kaldırma tek bir bilgisayarda (Windows 11) sınandı. Başka servis sağlayıcılarda ve uzun süreli kullanımda denenmedi. Bozuk bir şey görürsen [sorun aç](https://github.com/uruskan/SONdpi/issues).
+> **Erken sürüm.** Motor 131 birim testinden geçiyor ve Turkcell 5G ev internetinde sınandı ([sonuçlar aşağıda](#sondpi-bu-hatta-ne-yaptı)). Kurulum, servis, anahtar ve kaldırma tek bir bilgisayarda (Windows 11) sınandı. Başka servis sağlayıcılarda ve uzun süreli kullanımda denenmedi. Bozuk bir şey görürsen [sorun aç](https://github.com/uruskan/SONdpi/issues).
 
 ## Neden var
 
@@ -101,8 +101,15 @@ Paket yakalama için [WinDivert](https://reqrypt.org/windivert.html) sürücüs�
 ## Kullanım
 
 - **Sol tık:** aç / kapat.
-- **Sağ tık:** durum (korunan bağlantı, kurtarılan bağlantı, DNS yanıtı sayıları), "Windows açılışında başlat", "SONdpi'yi kaldır", "Çıkış".
-- **Simge rengi:** yeşil açık, gri kapalı, sarı sorun var (ayrıntı menüde yazar).
+- **Sağ tık:** en üstte maskotun büyük hâli ve durum; altında sayaçlar (korunan bağlantı, kurtarılan bağlantı, DNS yanıtı), "Windows açılışında başlat", "Maskot simgesi", "SONdpi'yi kaldır", "Çıkış".
+- **Simge:** maskotun yüzü. Açıkken uyanık ve köşesinde yeşil onay, kapalıyken uyuyor ve gri, sorun varken endişeli ve köşesinde sarı ünlem (ayrıntı menüde yazar).
+- **Maskotu istemiyorsan:** menüden "Maskot simgesi" işaretini kaldır; düz bir anahtar simgesi gelir.
+
+<p align="center">
+  <img src="assets/ekran/menu-acik.png" alt="Sağ tık menüsü, açık: uyanık maskot" width="200">
+  <img src="assets/ekran/menu-kapali.png" alt="Sağ tık menüsü, kapalı: uyuyan maskot" width="200">
+  <img src="assets/ekran/menu-sorun.png" alt="Sağ tık menüsü, sorun var: endişeli maskot" width="213">
+</p>
 
 ## Bu hatta ne ölçtük
 

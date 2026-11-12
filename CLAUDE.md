@@ -32,7 +32,9 @@ Bunlar tahmin değil, bu hatta yapılan ölçümlerdir. Başka servis sağlayıc
 
 **Devir ve yükseltme (2026-11-13).** Kurulum `GoodbyeDPI` servisini durdurup elle başlatmaya aldı, kaldırma eski hâline döndürdü (çalışıyor, otomatik). Yetkisiz `sondpi.exe install` uygulamanın kendi UAC istemiyle kurulu sürümün üstüne yükseltti (1,8 sn; kullanımdaki exe `.old` olarak kenara alınıyor).
 
-**Sürüm.** `v0.1.0` ön sürüm olarak yayınlandı (2026-11-13): `SONdpi-0.1.0-windows-x64.zip` (exe, WinDivert dosyaları, lisanslar, `OKU.txt`). Geliştirme bilgisayarında bu sürüm kalıcı olarak kurulu ve GoodbyeDPI kaldırıldı; yeni derlemeyi denemek için üstüne `sondpi.exe install` çalıştırılır.
+**Maskot (2026-11-13, kullanıcının isteği).** Uygulamada maskot varsayılan olarak görünür: tepsi simgesi maskotun yüzüdür (açık: uyanık, kapalı: uyuyor, sorun: endişeli; köşe rozeti 16 pikselde durumu rengiyle söyler) ve sağ tık menüsünün en üstünde büyük portresi durur. Menüdeki "Maskot simgesi" kapatılırsa ikisi de gider. Çizimler `tools/ikon-uret.ps1` içindedir; `assets/` altındaki `.ico`, `.rc` ve `.res` ondan üretilir ve commit'lenir, `build.rs` `.res` dosyasını exe'ye bağlar. Menü yalnızca %100 ölçekte ve açık temada gözle görüldü.
+
+**Sürüm.** `v0.1.1` (maskot, GoodbyeDPI devri, yükseltmede tepsi değişimi) ve `v0.1.0` ön sürüm olarak yayınlandı (2026-11-13): `SONdpi-0.1.0-windows-x64.zip` (exe, WinDivert dosyaları, lisanslar, `OKU.txt`). Geliştirme bilgisayarında bu sürüm kalıcı olarak kurulu ve GoodbyeDPI kaldırıldı; yeni derlemeyi denemek için üstüne `sondpi.exe install` çalıştırılır.
 
 ## Mimari
 

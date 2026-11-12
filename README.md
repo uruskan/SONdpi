@@ -22,7 +22,7 @@
 </p>
 
 > [!WARNING]
-> **Erken sürüm.** Motor 118 birim testinden geçiyor ve Turkcell 5G ev internetinde sınandı ([sonuçlar aşağıda](#sondpi-bu-hatta-ne-yaptı)). Başka servis sağlayıcılarda denenmedi; kurulum ve servis akışı henüz gerçek bir sistemde sınanmadı. Bozuk bir şey görürsen [sorun aç](https://github.com/uruskan/SONdpi/issues).
+> **Erken sürüm.** Motor 118 birim testinden geçiyor ve Turkcell 5G ev internetinde sınandı ([sonuçlar aşağıda](#sondpi-bu-hatta-ne-yaptı)). Kurulum, servis, anahtar ve kaldırma tek bir bilgisayarda (Windows 11) sınandı. Başka servis sağlayıcılarda ve uzun süreli kullanımda denenmedi. Bozuk bir şey görürsen [sorun aç](https://github.com/uruskan/SONdpi/issues).
 
 ## Neden var
 

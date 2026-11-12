@@ -55,6 +55,16 @@ Hayır. Bir anahtar olmalı. Açarsın, çalışır. Kapatırsın, hiçbir iz ka
 
 Son satırı atlama. GoodbyeDPI kendini kanıtladı, SONdpi henüz kanıtlıyor.
 
+### Peki ya SplitWire?
+
+Onu da denedik. Aynı işi yapmanın 35 farklı yolunu sunuyor: standart kurulum, alternatif kurulum, alternatifin alternatifi, bir sekme daha, bir tane daha. Bizim hatta 35'i de aynı kararlılıkla çalışmadı; bu da bir tür tutarlılık.
+
+Hakkını yemeyelim, en iyi çalışan özelliği "Kaldır" düğmesiydi. İlk denemede, hatasız.
+
+SONdpi'nin yaklaşımı tersi: 35 seçenek yok, bir anahtar var. Hangi yöntemin tuttuğunu bulmak senin değil programın işi.
+
+<sub>Şaka bir yana: gönüllü emeğiyle yazılmış açık kaynak bir araç ve başka hatlarda işe yarıyor olabilir. Bu bölüm tek bir hattaki deneyimdir, ölçüm değil.</sub>
+
 ## Nasıl çalışır
 
 ```mermaid

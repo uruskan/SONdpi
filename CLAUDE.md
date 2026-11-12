@@ -30,6 +30,10 @@ Bunlar tahmin değil, bu hatta yapılan ölçümlerdir. Başka servis sağlayıc
 
 **Kurulum sınaması (2026-11-13, `tools/kurulum-testi.ps1`).** Kurulum 254 ms; servis LocalSystem, otomatik başlangıç, hata sonrası 5 sn'de yeniden başlama. Servis üzerinden TLS 16/16, bağlantı 160/160. Anahtar kapatılınca engelli adlar 0/8, açılınca 8/8. Anahtarın konumu servis yeniden başlayınca korunuyor (açık da kapalı da). Yetkisiz oturumdan kontrol borusu ve tepsi çalışıyor; simgeye tıklama anahtarı çeviriyor, ipucu durumu gösteriyor. Kaldırma 3,2 sn; servis, klasör, kayıt anahtarı ve süreç kalmıyor. Sınanmayanlar: çift tıkla ilk çalıştırma (uygulamanın kendi UAC istemi), sağ tık menüsündeki kaldırma ve "Windows açılışında başlat", yeniden başlatma sonrası açılış. Not: WinDivert sürücüsü bir kez yüklenince araçlar arasında bellekte kalıyor; yüklü olan, ilk yükleyen aracın klasöründeki dosyadır.
 
+**Devir ve yükseltme (2026-11-13).** Kurulum `GoodbyeDPI` servisini durdurup elle başlatmaya aldı, kaldırma eski hâline döndürdü (çalışıyor, otomatik). Yetkisiz `sondpi.exe install` uygulamanın kendi UAC istemiyle kurulu sürümün üstüne yükseltti (1,8 sn; kullanımdaki exe `.old` olarak kenara alınıyor).
+
+**Sürüm.** `v0.1.0` ön sürüm olarak yayınlandı (2026-11-13): `SONdpi-0.1.0-windows-x64.zip` (exe, WinDivert dosyaları, lisanslar, `OKU.txt`). Geliştirme bilgisayarında bu sürüm kalıcı olarak kurulu ve GoodbyeDPI kaldırıldı; yeni derlemeyi denemek için üstüne `sondpi.exe install` çalıştırılır.
+
 ## Mimari
 
 Tek dosya: `sondpi.exe`. Rolü argüman belirler (`src/main.rs`): argümansız tepsi anahtarı, `service` motoru barındıran Windows servisi, `dev` ölçüm için konsol kipi, `install` / `uninstall`.

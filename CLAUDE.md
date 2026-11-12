@@ -26,6 +26,8 @@ Bunlar tahmin değil, bu hatta yapılan ölçümlerdir. Başka servis sağlayıc
 
 **DNS.** Modemin dağıttığı çözümleyici (IPv6'da bağlantı-yerel `fe80::` adresi) engelli alan adları için engel sayfasının adresini döndürüyor ve Windows onu elle girilen IPv4 DNS'in önüne alıyor. Hedefi yeniden yazarak yönlendirme (GoodbyeDPI'nin yaptığı) bağlantı-yerel kaynak adresi yüzünden IPv6'da çalışmıyor. Bu hatta düz UDP/53 ile genel çözümleyicilere sorulan sorular doğru yanıtlanıyor, ama başka sağlayıcılar 53'ü de bozabilir; bu yüzden yanıt DoH ile alınır.
 
+**Motorun ilk gerçek hat sınaması (2026-11-13, `tools/hat-testi.ps1`).** Aynı dakikalarda arka arkaya: engelli adlara TLS, GoodbyeDPI 28/30, SONdpi 40/40; Cloudflare'in üç adresine TCP bağlantısı, GoodbyeDPI 332/360, SONdpi 360/360, yeniden arama kapalıyken SONdpi 335/360. Motor 534 SYN'in 30'unu yanıtsız bulup 30'unu da yedek porttan kurtardı (ortanca 339 ms, biri ikinci yedekle). Modemin IPv4 ve `fe80::` çözümleyicisine sorulan engelli adlar gerçek adreslerle yanıtlandı. 25 MB indirme 16,2 MB/sn (GoodbyeDPI ile 17,1). Motor temiz kapandı, gönderim hatası yok. Sınanmayanlar: kurulum, servis ve tepsinin gerçek motorla çalışması; uzun süreli kullanım; yükleme (upload) hızı; başka sağlayıcılar.
+
 ## Mimari
 
 Tek dosya: `sondpi.exe`. Rolü argüman belirler (`src/main.rs`): argümansız tepsi anahtarı, `service` motoru barındıran Windows servisi, `dev` ölçüm için konsol kipi, `install` / `uninstall`.

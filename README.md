@@ -22,7 +22,7 @@
 </p>
 
 > [!WARNING]
-> **Erken sürüm.** Motor 118 birim testinden geçiyor, ama gerçek hattaki sınaması henüz tamamlanmadı. Hat ölçümleri şu an yalnızca Turkcell 5G ev internetinde yapıldı; başka servis sağlayıcılarda denenmedi. Bozuk bir şey görürsen [sorun aç](https://github.com/uruskan/SONdpi/issues).
+> **Erken sürüm.** Motor 118 birim testinden geçiyor ve Turkcell 5G ev internetinde sınandı ([sonuçlar aşağıda](#sondpi-bu-hatta-ne-yaptı)). Başka servis sağlayıcılarda denenmedi; kurulum ve servis akışı henüz gerçek bir sistemde sınanmadı. Bozuk bir şey görürsen [sorun aç](https://github.com/uruskan/SONdpi/issues).
 
 ## Neden var
 
@@ -120,6 +120,22 @@ Aracı tahminle değil ölçümle yazdık. Kasım 2026, Turkcell 5G ev interneti
 
 Yani "GoodbyeDPI çalışıyor ama on bağlantıdan biri takılıyor" şikâyetinin nedeni DPI değil, kaybolan bağlantı istekleriydi. Yeniden arama bunun için var.
 
+### SONdpi bu hatta ne yaptı
+
+Aynı hat, aynı dakikalar, arka arkaya (13 Kasım 2026). Tek bir ölçüm turu; örneklem küçük, başka hatlarda sonuç farklı olabilir.
+
+| Ölçüm | Hiçbir araç | GoodbyeDPI `-5 --frag-by-sni` | SONdpi 0.1 |
+|---|---|---|---|
+| Engelli dört alan adına TLS el sıkışması | 0 / 8 | 28 / 30 (beşinci, engelsiz ad dahil) | **40 / 40** |
+| Cloudflare'in üç adresine TCP bağlantısı | — | 332 / 360 | **360 / 360** |
+| Aynısı, yeniden arama kapalıyken | — | — | 335 / 360 |
+| Modemin çözümleyicisine sorulan `discord.com` | engel sayfası | — | gerçek adresler |
+| Cloudflare'den 25 MB indirme | — | 17,1 MB/sn | 16,2 MB/sn |
+
+- Motor 534 bağlantı isteğinin 30'unu yanıtsız buldu ve 30'unu da yedek porttan kurtardı; biri ikinci yedeği gerektirdi.
+- Kurtarılan bağlantılar ortanca 339 ms'de kuruldu (250 ms bekleme + olağan bağlantı süresi). Kurtarılmasalardı uygulama zaman aşımına düşecekti.
+- İndirme hızındaki fark tek ölçümde gürültü payının içinde.
+
 ## Sık sorulanlar
 
 **VPN mi bu?**
@@ -132,7 +148,7 @@ Kaynak kodu burada, tek bağımlılığı Microsoft'un `windows-sys` paketi. Yö
 Turkcell 5G'de ölçüldü. Türk Telekom, Superonline, Vodafone ve diğerlerinde henüz denenmedi. Denersen sonucu yaz, tabloya ekleyelim.
 
 **İnternetimi yavaşlatır mı?**
-Bağlantının ilk paketlerine, DNS sorgularına ve yeniden aranan bağlantılara dokunur; geri kalan trafik olduğu gibi akar. Hız ölçümleri gerçek hat testleriyle birlikte yayınlanacak.
+Bağlantının ilk paketlerine, DNS sorgularına ve yeniden aranan bağlantılara dokunur; geri kalan trafik olduğu gibi akar. Ölçtüğümüz hatta 25 MB'lık indirme GoodbyeDPI ile 17,1, SONdpi ile 16,2 MB/sn çıktı (tek ölçüm).
 
 **Kapatınca ne olur?**
 Açmadan önce ne idiyse o. Değiştirdiği bir sistem ayarı yok ki geri alsın.

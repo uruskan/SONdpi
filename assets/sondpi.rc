@@ -2,6 +2,9 @@
 1 ICON "icons\\acik.ico"
 2 ICON "icons\\kapali.ico"
 3 ICON "icons\\sorun.ico"
+11 ICON "icons\\acik-portre.ico"
+12 ICON "icons\\kapali-portre.ico"
+13 ICON "icons\\sorun-portre.ico"
 
 1 VERSIONINFO
 FILEVERSION 0,1,1,0

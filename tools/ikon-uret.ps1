@@ -20,7 +20,7 @@ $States = @{
   sorun  = @{ ht = '#a48bff'; hb = '#5a3fd6'; hk = '#4a35b8'; skin = '#ffe3d3'; pin = '#f59e0b'; pind = '#b45309'; badge = '#f59e0b'; knob = 22.6 }
 }
 
-function Svg([string]$state, [bool]$small) {
+function Svg([string]$state, [bool]$small, [bool]$withBadge = $true) {
   $c = $States[$state]
   $head = @"
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="512" height="512">
@@ -91,7 +91,7 @@ function Svg([string]$state, [bool]$small) {
     'kapali' { "<path d=`"M$($bc.x - 5) $($bc.y) h10`" fill=`"none`" stroke=`"#fff`" stroke-width=`"$($bc.w)`" stroke-linecap=`"round`"/>" }
     'sorun'  { "<path d=`"M$($bc.x) $($bc.y - 6) v6.6`" fill=`"none`" stroke=`"#fff`" stroke-width=`"$($bc.w)`" stroke-linecap=`"round`"/><circle cx=`"$($bc.x)`" cy=`"$($bc.y + 5.4)`" r=`"$([math]::Round($bc.w * 0.62, 2))`" fill=`"#fff`"/>" }
   }
-  $badge = "<circle cx=`"$($bc.x)`" cy=`"$($bc.y)`" r=`"$($bc.ro)`" fill=`"#fff`"/><circle cx=`"$($bc.x)`" cy=`"$($bc.y)`" r=`"$($bc.ri)`" fill=`"$($c.badge)`"/>$glyph"
+  $badge = if ($withBadge) { "<circle cx=`"$($bc.x)`" cy=`"$($bc.y)`" r=`"$($bc.ro)`" fill=`"#fff`"/><circle cx=`"$($bc.x)`" cy=`"$($bc.y)`" r=`"$($bc.ri)`" fill=`"$($c.badge)`"/>$glyph" } else { '' }
   return "$head$face`n$hair$pin`n$badge`n</svg>`n"
 }
 
@@ -163,6 +163,7 @@ function WriteIco([string]$path, [System.Drawing.Bitmap[]]$images) {
 $SmallSizes = 16, 20, 24
 $BigSizes = 32, 40, 48, 64, 256
 $sheet = @{}
+$portraits = @{}
 foreach ($state in 'acik', 'kapali', 'sorun') {
   $imgs = @()
   foreach ($variant in @(@{ small = $true; tag = 'kucuk'; sizes = $SmallSizes }, @{ small = $false; tag = 'ayrintili'; sizes = $BigSizes })) {
@@ -177,6 +178,17 @@ foreach ($state in 'acik', 'kapali', 'sorun') {
   WriteIco (Join-Path $Icons "$state.ico") $imgs
   $sheet[$state] = $imgs
   Write-Host "$state.ico: $($imgs.Count) images, $((Get-Item (Join-Path $Icons "$state.ico")).Length) bytes"
+
+  # Large portrait without the corner badge, for the header of the right-click menu.
+  $svg = Join-Path $SrcD "$state-portre.svg"
+  [IO.File]::WriteAllText($svg, (Svg $state $false $false))
+  $png = Join-Path $Tmp "$state-portre.png"
+  Render $svg $png
+  $src = New-Object System.Drawing.Bitmap $png
+  $pimgs = @(); foreach ($s in 128, 256) { $pimgs += (Scale $src $s) }
+  $src.Dispose()
+  WriteIco (Join-Path $Icons "$state-portre.ico") $pimgs
+  $portraits[$state] = $pimgs
 }
 
 # Preview sheet: every state at tray sizes on a dark and a light taskbar colour, plus a 4x
@@ -218,12 +230,32 @@ $g.Dispose()
 $bmp.Save((Join-Path $Icons 'onizleme.png'), [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp.Dispose()
 
+# Portrait preview: the three large portraits on a light and a dark menu colour.
+$pb = New-Object System.Drawing.Bitmap 880, 300
+$g = [System.Drawing.Graphics]::FromImage($pb)
+$g.Clear([System.Drawing.Color]::FromArgb(255, 249, 249, 249))
+$g.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 43, 43, 43))), 440, 0, 440, 300)
+foreach ($half in 0, 440) {
+  $x = $half + 22
+  foreach ($state in 'acik', 'kapali', 'sorun') {
+    $im = $portraits[$state] | Where-Object { $_.Width -eq 128 } | Select-Object -First 1
+    $g.DrawImage($im, $x, 86, 128, 128)
+    $x += 134
+  }
+}
+$g.Dispose()
+$pb.Save((Join-Path $Icons 'onizleme-portre.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+$pb.Dispose()
+
 # Resource script and compiled resources.
 $rc = @'
 #pragma code_page(65001)
 1 ICON "icons\\acik.ico"
 2 ICON "icons\\kapali.ico"
 3 ICON "icons\\sorun.ico"
+11 ICON "icons\\acik-portre.ico"
+12 ICON "icons\\kapali-portre.ico"
+13 ICON "icons\\sorun-portre.ico"
 
 1 VERSIONINFO
 FILEVERSION VERCOMMA

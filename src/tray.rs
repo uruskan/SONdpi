@@ -10,7 +10,7 @@
 use crate::api::{self, Status};
 use crate::install::{self, wide};
 use crate::ipc::{self, ReqError};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
@@ -28,6 +28,19 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER;
+use windows_sys::Win32::Foundation::RECT;
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateFontIndirectW, DeleteObject as DeleteGdi, DrawTextW, FillRect, GetTextMetricsW, MonitorFromPoint,
+    SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, MONITOR_DEFAULTTONEAREST,
+    TEXTMETRICW, TRANSPARENT,
+};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DrawIconEx, DI_NORMAL, MF_DISABLED, MF_OWNERDRAW, NONCLIENTMETRICSW, WM_DRAWITEM, WM_MEASUREITEM,
+};
+use windows_sys::Win32::Graphics::Gdi::{GetSysColor, GetSysColorBrush, COLOR_MENU, COLOR_MENUTEXT};
+use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
+use windows_sys::Win32::Graphics::Gdi::{GetDC as GetDcGdi, ReleaseDC as ReleaseDcGdi};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{
@@ -83,6 +96,7 @@ const ID_AUTOSTART: usize = 6;
 const ID_UNINSTALL: usize = 7;
 const ID_EXIT: usize = 8;
 const ID_MASCOT: usize = 9;
+const ID_HEADER: usize = 10;
 
 // ---------------------------------------------------------------------------------------------
 // What the user sees (pure logic)
@@ -220,14 +234,67 @@ pub struct MenuEntry {
     pub grayed: bool,
     pub checked: Option<bool>,
     pub separator: bool,
+    /// The mascot header (owner-drawn); 	ext is then its state line.
+    pub header: Option<IconState>,
+}
+
+/// Portrait icon resource (no corner badge): 11 on, 12 off, 13 problem.
+pub fn portrait_resource_id(s: IconState) -> u16 {
+    resource_id(s) + 10
+}
+
+/// The state line under the mascot's name.
+pub fn state_line(s: IconState) -> &'static str {
+    match s {
+        IconState::On => "Açık",
+        IconState::Off => "Kapalı",
+        IconState::Problem => "Sorun var",
+    }
+}
+
+/// Colour of the state line (RGB): green, grey, amber; readable on light and dark menus.
+pub fn state_line_color(s: IconState) -> (u8, u8, u8) {
+    match s {
+        IconState::On => (36, 168, 96),
+        IconState::Off => (128, 135, 148),
+        IconState::Problem => (224, 150, 0),
+    }
+}
+
+/// Where things go in the header, in device pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderMetrics {
+    pub width: i32,
+    pub height: i32,
+    pub icon_y: i32,
+    pub title_y: i32,
+    pub line_y: i32,
+}
+
+fn scale(dpi: u32, v: i32) -> i32 {
+    (v as i64 * dpi.max(96) as i64 / 96) as i32
+}
+
+/// portrait is the portrait size in device pixels; 	itle_h/line_h the text heights.
+pub fn header_metrics(dpi: u32, portrait: i32, title_h: i32, line_h: i32) -> HeaderMetrics {
+    let icon_y = scale(dpi, 14);
+    let title_y = icon_y + portrait + scale(dpi, 6);
+    let line_y = title_y + title_h + scale(dpi, 1);
+    HeaderMetrics { width: portrait + scale(dpi, 40), height: line_y + line_h + scale(dpi, 14), icon_y, title_y, line_y }
 }
 
 /// The whole menu, in order.
 pub fn menu_entries(v: &View, autostart: bool, mascot: bool) -> Vec<MenuEntry> {
     let m = menu_model(v);
-    let item = |id: usize, text: &str, grayed: bool, checked: Option<bool>| MenuEntry { id, text: text.to_string(), grayed, checked, separator: false };
-    let sep = || MenuEntry { id: 0, text: String::new(), grayed: false, checked: None, separator: true };
-    let mut out = vec![item(ID_TOGGLE, "Açık", false, Some(m.checked))];
+    let item = |id: usize, text: &str, grayed: bool, checked: Option<bool>| MenuEntry { id, text: text.to_string(), grayed, checked, separator: false, header: None };
+    let sep = || MenuEntry { id: 0, text: String::new(), grayed: false, checked: None, separator: true, header: None };
+    let mut out = Vec::new();
+    if mascot {
+        let st = icon_state(v);
+        out.push(MenuEntry { id: ID_HEADER, text: state_line(st).to_string(), grayed: true, checked: None, separator: false, header: Some(st) });
+        out.push(sep());
+    }
+    out.push(item(ID_TOGGLE, "Açık", false, Some(m.checked)));
     for (i, l) in m.lines.iter().enumerate() {
         out.push(item(ID_INFO_BASE + i, l, true, None));
     }
@@ -430,6 +497,8 @@ struct Tray {
     /// The setting the current icons were built for.
     icons_mascot: bool,
     mascot: bool,
+    /// The open menu has the mascot header.
+    header: bool,
     shown: Option<(IconState, String)>,
     added: bool,
     polling: bool,
@@ -532,7 +601,7 @@ fn refresh_ui(hwnd: HWND) {
             t.shown = Some((st, tip));
         }
         if !t.menu.is_null() {
-            update_menu(t.menu, &menu_model(&ev));
+            update_menu(t.menu, &menu_model(&ev), if t.header { Some(st) } else { None });
         }
     });
 }
@@ -725,6 +794,147 @@ fn offer_install(hwnd: HWND) {
 // Menu
 // ---------------------------------------------------------------------------------------------
 
+// ----- the owner-drawn mascot header -----
+
+#[derive(Clone, Copy)]
+struct HeaderGeom {
+    dpi: u32,
+    px: i32,
+    /// Portrait icons per state (index as icon_index), 0 when not loaded.
+    icons: [usize; 3],
+}
+
+thread_local! {
+    /// Kept apart from the tray state: Windows asks for the item's size synchronously while the
+    /// menu is being changed under a state borrow.
+    static HEADER: Cell<HeaderGeom> = const { Cell::new(HeaderGeom { dpi: 96, px: 128, icons: [0; 3] }) };
+}
+
+fn state_from_data(d: usize) -> IconState {
+    match d {
+        1 => IconState::On,
+        3 => IconState::Problem,
+        _ => IconState::Off,
+    }
+}
+
+fn rgb(c: (u8, u8, u8)) -> u32 {
+    c.0 as u32 | (c.1 as u32) << 8 | (c.2 as u32) << 16
+}
+
+fn monitor_dpi(at: POINT) -> u32 {
+    // SAFETY: plain queries; falls back to the system DPI.
+    unsafe {
+        let mon = MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST);
+        let (mut x, mut y) = (0u32, 0u32);
+        if !mon.is_null() && GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut x, &mut y) == 0 && x != 0 {
+            x
+        } else {
+            GetDpiForSystem().max(96)
+        }
+    }
+}
+
+/// Portraits of all three states at 128 dip scaled to dpi.
+fn load_portraits(dpi: u32) -> HeaderGeom {
+    let px = scale(dpi, 128);
+    let mut icons = [0usize; 3];
+    for s in [IconState::On, IconState::Off, IconState::Problem] {
+        // SAFETY: MAKEINTRESOURCE(id); the icon is ours and freed in free_portraits.
+        let h = unsafe {
+            LoadImageW(GetModuleHandleW(null()), portrait_resource_id(s) as usize as *const u16, IMAGE_ICON, px, px, LR_DEFAULTCOLOR)
+        };
+        icons[icon_index(s)] = h as usize;
+    }
+    HeaderGeom { dpi, px, icons }
+}
+
+fn free_portraits(g: &HeaderGeom) {
+    for h in g.icons {
+        if h != 0 {
+            // SAFETY: created by LoadImageW in load_portraits.
+            unsafe { DestroyIcon(h as HICON) };
+        }
+    }
+}
+
+/// Menu fonts (regular, bold) at dpi; free both with DeleteGdi.
+fn menu_fonts(dpi: u32) -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
+    // SAFETY: all-zero is a valid NONCLIENTMETRICSW; cbSize is set before the call.
+    let mut ncm: NONCLIENTMETRICSW = unsafe { std::mem::zeroed() };
+    ncm.cbSize = std::mem::size_of::<NONCLIENTMETRICSW>() as u32;
+    // SAFETY: valid struct of the declared size.
+    unsafe { SystemParametersInfoForDpi(0x29, ncm.cbSize, &mut ncm as *mut _ as *mut std::ffi::c_void, 0, dpi) };
+    let mut bold = ncm.lfMenuFont;
+    bold.lfWeight = 700;
+    // SAFETY: fonts are deleted by the caller.
+    unsafe { (CreateFontIndirectW(&ncm.lfMenuFont), CreateFontIndirectW(&bold)) }
+}
+
+fn text_height(hdc: *mut std::ffi::c_void, font: *mut std::ffi::c_void) -> i32 {
+    // SAFETY: all-zero is a valid TEXTMETRICW; the font stays selected only for the query.
+    unsafe {
+        let mut tm: TEXTMETRICW = std::mem::zeroed();
+        let old = SelectObject(hdc, font);
+        GetTextMetricsW(hdc, &mut tm);
+        SelectObject(hdc, old);
+        tm.tmHeight
+    }
+}
+
+fn on_measure_item(hwnd: HWND, mi: &mut MEASUREITEMSTRUCT) {
+    let g = HEADER.get();
+    let (reg, bold) = menu_fonts(g.dpi);
+    // SAFETY: DC of our window for the measurement only; fonts freed.
+    let m = unsafe {
+        let hdc = GetDcGdi(hwnd);
+        let m = header_metrics(g.dpi, g.px, text_height(hdc, bold), text_height(hdc, reg));
+        ReleaseDcGdi(hwnd, hdc);
+        DeleteGdi(reg);
+        DeleteGdi(bold);
+        m
+    };
+    mi.itemWidth = m.width as u32;
+    mi.itemHeight = m.height as u32;
+}
+
+fn on_draw_item(dis: &DRAWITEMSTRUCT) {
+    let g = HEADER.get();
+    let st = state_from_data(dis.itemData);
+    let (reg, bold) = menu_fonts(g.dpi);
+    let hdc = dis.hDC;
+    let rc = dis.rcItem;
+    // SAFETY: drawing into the DC Windows handed us; everything selected is restored, fonts freed.
+    unsafe {
+        FillRect(hdc, &rc, GetSysColorBrush(COLOR_MENU));
+        let m = header_metrics(g.dpi, g.px, text_height(hdc, bold), text_height(hdc, reg));
+        let icon = g.icons[icon_index(st)];
+        if icon != 0 {
+            let x = rc.left + ((rc.right - rc.left) - g.px) / 2;
+            DrawIconEx(hdc, x, rc.top + m.icon_y, icon as HICON, g.px, g.px, 0, null_mut(), DI_NORMAL);
+        }
+        SetBkMode(hdc, TRANSPARENT as i32);
+        let old = SelectObject(hdc, bold);
+        SetTextColor(hdc, GetSysColor(COLOR_MENUTEXT));
+        let mut r = RECT { left: rc.left, top: rc.top + m.title_y, right: rc.right, bottom: rc.top + m.title_y + text_height(hdc, bold) };
+        let t = wide("SONdpi");
+        DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, reg);
+        SetTextColor(hdc, rgb(state_line_color(st)));
+        let mut r = RECT { left: rc.left, top: rc.top + m.line_y, right: rc.right, bottom: rc.top + m.line_y + text_height(hdc, reg) };
+        let t = wide(state_line(st));
+        DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, old);
+        DeleteGdi(reg);
+        DeleteGdi(bold);
+    }
+}
+
+fn append_header(menu: HMENU, st: IconState) {
+    // SAFETY: owner-drawn item; the app value carries the state (1 on, 2 off, 3 problem).
+    unsafe { AppendMenuW(menu, MF_OWNERDRAW | MF_DISABLED, ID_HEADER, resource_id(st) as usize as *const u16) };
+}
+
 fn item_flags(grayed: bool, checked: Option<bool>) -> u32 {
     let mut f = MF_STRING;
     if grayed {
@@ -738,7 +948,11 @@ fn item_flags(grayed: bool, checked: Option<bool>) -> u32 {
     f
 }
 
-fn update_menu(menu: HMENU, m: &MenuModel) {
+fn update_menu(menu: HMENU, m: &MenuModel, header: Option<IconState>) {
+    if let Some(st) = header {
+        // SAFETY: re-sets the owner-drawn item so it is redrawn with the new state.
+        unsafe { ModifyMenuW(menu, ID_HEADER as u32, MF_BYCOMMAND | MF_OWNERDRAW | MF_DISABLED, ID_HEADER, resource_id(st) as usize as *const u16) };
+    }
     for (i, line) in m.lines.iter().enumerate() {
         let id = ID_INFO_BASE + i;
         let w = wide(line);
@@ -771,8 +985,24 @@ fn show_menu(hwnd: HWND, at: POINT) {
     if menu.is_null() {
         return;
     }
-    for e in menu_entries(&ev, auto, mascot) {
-        if e.separator {
+    let mut entries = menu_entries(&ev, auto, mascot);
+    let mut geom = None;
+    if entries.first().map(|e| e.header.is_some()).unwrap_or(false) {
+        let g = load_portraits(monitor_dpi(at));
+        if g.icons[icon_index(icon_state(&ev))] == 0 {
+            // No portrait (no resources): the menu is the plain one.
+            free_portraits(&g);
+            entries.drain(..2);
+        } else {
+            HEADER.set(g);
+            geom = Some(g);
+        }
+    }
+    with(|t| t.header = geom.is_some());
+    for e in entries {
+        if let Some(st) = e.header {
+            append_header(menu, st);
+        } else if e.separator {
             // SAFETY: valid menu.
             unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) };
         } else {
@@ -788,9 +1018,16 @@ fn show_menu(hwnd: HWND, at: POINT) {
         PostMessageW(hwnd, WM_NULL, 0, 0);
         c
     };
-    with(|t| t.menu = null_mut());
+    with(|t| {
+        t.menu = null_mut();
+        t.header = false;
+    });
     // SAFETY: menu created above and no longer tracked.
     unsafe { DestroyMenu(menu) };
+    if let Some(g) = geom {
+        free_portraits(&g);
+        HEADER.set(HeaderGeom { dpi: 96, px: 128, icons: [0; 3] });
+    }
 
     match cmd as usize {
         ID_TOGGLE => toggle(hwnd),
@@ -894,6 +1131,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let r = unsafe { Box::from_raw(lp as *mut Reply) };
             on_reply(hwnd, *r);
             0
+        }
+        WM_MEASUREITEM => {
+            // SAFETY: for owner-drawn menu items lp points to a MEASUREITEMSTRUCT.
+            let mi = unsafe { &mut *(lp as *mut MEASUREITEMSTRUCT) };
+            if mi.CtlType == 1 && mi.CtlID as usize == ID_HEADER || mi.itemID as usize == ID_HEADER {
+                on_measure_item(hwnd, mi);
+                return 1;
+            }
+            // SAFETY: default handling.
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_DRAWITEM => {
+            // SAFETY: for owner-drawn menu items lp points to a DRAWITEMSTRUCT.
+            let dis = unsafe { &*(lp as *const DRAWITEMSTRUCT) };
+            if dis.itemID as usize == ID_HEADER {
+                on_draw_item(dis);
+                return 1;
+            }
+            // SAFETY: default handling.
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_TIMER if wp == TIMER_POLL => {
             poll(hwnd);
@@ -1087,6 +1344,7 @@ pub fn run(args: &[String]) -> i32 {
             icon_size: 0,
             icons_mascot: false,
             mascot: mascot_enabled(),
+            header: false,
             shown: None,
             added: false,
             polling: false,
@@ -1224,11 +1482,62 @@ mod tests {
         let mut e = live(false, false);
         e.error = Some("boom".into());
         let m = menu_entries(&View::Live(e), false, true);
-        assert_eq!(m[4].text, "boom");
-        assert!(m[4].grayed);
+        // Mascot on: header and its separator come first.
+        assert_eq!(m[0].header, Some(IconState::Problem));
+        assert!(m[1].separator);
+        assert_eq!(m[6].text, "boom");
+        assert!(m[6].grayed);
         let pos = |t: &str| m.iter().position(|x| x.text == t).unwrap();
         assert_eq!(pos("Maskot simgesi"), pos("Windows açılışında başlat") + 1);
         assert_eq!(m[pos("Maskot simgesi")].checked, Some(true));
+    }
+
+    #[test]
+    fn header_only_with_mascot() {
+        let v = View::Live(live(true, true));
+        let on = menu_entries(&v, false, true);
+        assert_eq!(on[0].header, Some(IconState::On));
+        assert_eq!(on[0].id, ID_HEADER);
+        assert_eq!(on[0].text, "Açık");
+        assert!(on[0].grayed && !on[0].separator);
+        assert!(on[1].separator);
+        assert_eq!(on[2].text, "Açık");
+        assert_eq!(on[2].checked, Some(true));
+        let off = menu_entries(&v, false, false);
+        assert!(off.iter().all(|e| e.header.is_none()));
+        assert_eq!(off[0].id, ID_TOGGLE);
+        assert_eq!(on.len(), off.len() + 2);
+        assert_eq!(menu_entries(&View::Live(live(false, false)), false, true)[0].header, Some(IconState::Off));
+    }
+
+    #[test]
+    fn portrait_resources_and_state_lines() {
+        assert_eq!(portrait_resource_id(IconState::On), 11);
+        assert_eq!(portrait_resource_id(IconState::Off), 12);
+        assert_eq!(portrait_resource_id(IconState::Problem), 13);
+        assert_eq!(state_line(IconState::On), "Açık");
+        assert_eq!(state_line(IconState::Off), "Kapalı");
+        assert_eq!(state_line(IconState::Problem), "Sorun var");
+        let (g, k, a) = (state_line_color(IconState::On), state_line_color(IconState::Off), state_line_color(IconState::Problem));
+        assert!(g.1 > g.0 && g.1 > g.2, "green");
+        assert!(k.0.abs_diff(k.2) < 40 && k.0 > 90, "grey");
+        assert!(a.0 > 200 && a.1 > 120 && a.2 < 60, "amber");
+        assert!(g != k && k != a && g != a);
+        assert_eq!(state_from_data(resource_id(IconState::On) as usize), IconState::On);
+        assert_eq!(state_from_data(resource_id(IconState::Off) as usize), IconState::Off);
+        assert_eq!(state_from_data(resource_id(IconState::Problem) as usize), IconState::Problem);
+    }
+
+    #[test]
+    fn header_metrics_scale_with_dpi() {
+        let at = |dpi: u32| header_metrics(dpi, 128 * dpi as i32 / 96, 16 * dpi as i32 / 96, 16 * dpi as i32 / 96);
+        let (a, b, c) = (at(96), at(144), at(192));
+        assert_eq!(a.width, 168);
+        assert!(b.height * 2 == a.height * 3 || (b.height * 2 - a.height * 3).abs() <= 3);
+        assert!(c.height * 1 >= a.height * 2 - 4 && c.height <= a.height * 2 + 4);
+        for m in [a, b, c] {
+            assert!(m.icon_y > 0 && m.title_y > m.icon_y && m.line_y > m.title_y && m.height > m.line_y);
+        }
     }
 
     #[test]

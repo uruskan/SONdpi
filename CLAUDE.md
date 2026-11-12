@@ -51,7 +51,7 @@ Modüller arası sözleşme, iskelet dosyalardaki `pub` imzalardır. İmzayı ge
 - **Bağımlılık.** Tek crate `windows-sys`. Yeni crate ekleme. `Cargo.toml` içinde yalnızca `windows-sys` özellik listesine satır eklenebilir; başka hiçbir satıra dokunma.
 - **Dosya sahipliği.** Bir dosyaya aynı anda tek kişi yazar. Sana verilmeyen dosyaya dokunma; ihtiyacın varsa raporunda yaz.
 - **Derleme klasörü.** Her işçi kendi `CARGO_TARGET_DIR` klasörünü kullanır (görevinde yazar); varsayılan `target/` lidere aittir.
-- **Yönetici hakkı.** İşçiler yönetici gerektiren hiçbir şey çalıştırmaz, servis kurmaz, sürücü yüklemez, sistem ayarı değiştirmez. Motorun gerçek hatta denenmesi lidere aittir (`tools/dev-runner.ps1`).
+- **Yönetici hakkı.** İşçiler yönetici gerektiren hiçbir şey çalıştırmaz, servis kurmaz, sürücü yüklemez, sistem ayarı değiştirmez. Motorun gerçek hatta denenmesi lidere aittir ve her deneme kullanıcının onayıyla yapılır.
 - **Git.** Yalnızca lider commit atar. İşçiler `git add`, `commit`, `stash`, `reset`, `checkout`, `restore` çalıştırmaz. `git push` ve repo görünürlüğü kullanıcının onayına bağlıdır.
 - **unsafe.** Yalnızca FFI sınırında; her blokta neden güvenli olduğunu söyleyen tek satır. Paket mantığı güvenli Rust'tır ve birim testi vardır.
 - **Hata.** Motor ağın önünde durur: hiçbir ayrıştırma hatası panik üretmez; anlaşılmayan paket değiştirilmeden geçirilir. Bir iş parçacığı ölürse motor kendini kapatıp sürücü tanıtıcılarını bırakır (yarım çalışan motor, kapalı motordan kötüdür).
@@ -61,6 +61,6 @@ Modüller arası sözleşme, iskelet dosyalardaki `pub` imzalardır. İmzayı ge
 
 - `cargo test` saf mantığı sınar; `cargo build --release` exe'yi üretir. Uyarısız derlenmeli.
 - Gerçek hat ölçümleri `tools/` altındaki Node betikleriyle yapılır (yalnızca geliştirme için): `probe.js` (TLS el sıkışması, gerçek IP'ye sabitlenmiş), `synprobe.js` (yalnızca TCP bağlantısı; kayıp SYN oranı), `tuple.js` (aynı kaynak portu yeniden deneme).
-- Motoru denemek yönetici hakkı ister. `tools/dev-runner.ps1` bir kez yönetici olarak açılır ve `.dev/req` klasörüne bırakılan isteklerle motoru başlatıp durdurur (ayrıntı dosyanın başında). Bu, bu kullanıcı hesabında çalışan her programın o pencere açıkken motoru yönetici olarak çalıştırabilmesi demektir; iş bitince pencere kapatılır.
+- Motoru denemek yönetici hakkı ister. Açık kalan, istek dinleyen yönetici yardımcısı kurma: bu yol güvenliği zayıflattığı için reddedildi (2026-11-13). Her deneme, ne yapacağı önceden kullanıcıya söylenen ve kullanıcının onayladığı tek seferlik bir çalıştırmadır: motoru belli bir süre açar, ölçer, kapatır ve çıkar.
 - Bu makinede kurulu `GoodbyeDPI` servisi motorla aynı anda çalışmamalı; deneme sırasında durdurulur, deneme bitince yeniden başlatılır (kullanıcının interneti ona bağlı).
 - Akıcılığı ve gerçek uygulamaları (Discord uygulaması, sesli kanal) lider ölçemez; kullanıcıya bırakılır ve raporda ayrı yazılır.

@@ -144,7 +144,7 @@ pub fn run(args: &[String]) -> i32 {
     let final_stats = engine.stats();
     engine.stop();
     log.line(&stats_line(&final_stats));
-    match err {
+    let code = match err {
         Some(e) => {
             log.line(&format!("exit 3: engine failed: {e}"));
             eprintln!("engine failed: {e}");
@@ -154,7 +154,10 @@ pub fn run(args: &[String]) -> i32 {
             log.line("exit 0: stopped cleanly");
             0
         }
-    }
+    };
+    // Lines are written by a background thread; the process exits right after this.
+    log.flush(Duration::from_secs(3));
+    code
 }
 
 #[cfg(test)]

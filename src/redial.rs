@@ -35,7 +35,7 @@ pub struct RedialConfig {
     pub give_up_ms: u64,
     /// After the original port won, keep resetting late alternate SYN-ACKs for this long.
     pub loser_linger_ms: u64,
-    /// Keep a translation this long after RST or FIN in both directions.
+    /// Keep a translation this long after a plausible RST, or FIN in both directions.
     pub close_linger_ms: u64,
     /// Drop a translation after this long without a packet.
     pub idle_ms: u64,
@@ -56,7 +56,10 @@ impl Default for RedialConfig {
             give_up_ms: 30_000,
             loser_linger_ms: 30_000,
             close_linger_ms: 10_000,
-            idle_ms: 2 * 3600 * 1000,
+            // Windows sends the first TCP keepalive after 2 h of silence (KeepAliveTime
+            // default). A translation must outlive that comfortably, or a connection that only
+            // keeps itself alive with keepalives loses its mapping right before the probe.
+            idle_ms: 150 * 60 * 1000,
             dest_linger_ms: 5_000,
             max_tracked: 16_384,
         }
@@ -90,6 +93,8 @@ pub enum Event {
     LoserReset { remote: SocketAddr, lport: u16, port: u16 },
     /// Nobody answered any attempt.
     GaveUp { remote: SocketAddr, lport: u16, alternates: usize },
+    /// The server refused the connection (RST answering the SYN) on `port`; tracking ended.
+    Refused { remote: SocketAddr, lport: u16, port: u16, after_ms: u64, alternates: usize },
     /// A translation ended.
     MapClosed { remote: SocketAddr, lport: u16, alt: u16, reason: &'static str, pkts_in: u64, pkts_out: u64, age_ms: u64 },
 }
@@ -123,6 +128,12 @@ pub struct RedialStats {
     pub mapped: u64,
     pub translated_in: u64,
     pub translated_out: u64,
+    /// Tracked SYNs answered by a RST (connection refused).
+    pub refused: u64,
+    /// ICMP errors about translated flows rewritten back to the application's port.
+    pub icmp_translated: u64,
+    /// RSTs on translated flows ignored as implausible (sequence far from the flow).
+    pub rst_ignored: u64,
 }
 
 // ---- raw TCP header view ------------------------------------------------------------------
@@ -139,9 +150,15 @@ pub struct TcpView {
     pub flags: u8,
     pub seq: u32,
     pub ack: u32,
+    /// TCP payload bytes (from the IP length when it is consistent, else from the buffer).
+    pub payload_len: usize,
 }
 
 impl TcpView {
+    /// Sequence space this segment occupies (payload plus one each for SYN and FIN).
+    pub fn seg_len(&self) -> u32 {
+        self.payload_len as u32 + (self.flags & TCP_SYN != 0) as u32 + (self.flags & TCP_FIN != 0) as u32
+    }
     pub fn is_syn(&self) -> bool {
         self.flags & (TCP_SYN | TCP_ACK) == TCP_SYN
     }
@@ -194,6 +211,10 @@ pub fn tcp_view(b: &[u8]) -> Option<TcpView> {
     }
     let be16 = |o: usize| u16::from_be_bytes([b[o], b[o + 1]]);
     let be32 = |o: usize| u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let doff = ((b[l4 + 12] >> 4) as usize) * 4;
+    let ip_total = if v6 { 40 + be16(4) as usize } else { be16(2) as usize };
+    // Segmentation-offloaded packets may carry a zero or short IP length: trust the buffer then.
+    let end = if ip_total >= l4 + doff && ip_total <= b.len() { ip_total } else { b.len() };
     Some(TcpView {
         v6,
         l4,
@@ -202,7 +223,92 @@ pub fn tcp_view(b: &[u8]) -> Option<TcpView> {
         flags: b[l4 + 13],
         seq: be32(l4 + 4),
         ack: be32(l4 + 8),
+        payload_len: end.saturating_sub(l4 + doff),
     })
+}
+
+/// How far (in sequence space) a RST/FIN may sit from the flow's tracked next sequence number
+/// and still count. The tracking is loose (highest sequence seen so far, not the real window),
+/// so the bound is generous; a forged or stale segment is usually far outside it.
+pub const SEQ_SLACK: u32 = 1 << 24;
+
+fn seq_plausible(seq: u32, next: u32) -> bool {
+    (seq.wrapping_sub(next) as i32).unsigned_abs() <= SEQ_SLACK
+}
+
+fn seq_advance(next: &mut u32, v: &TcpView) {
+    let end = v.seq.wrapping_add(v.seg_len());
+    if (end.wrapping_sub(*next) as i32) > 0 {
+        *next = end;
+    }
+}
+
+/// Parse an inbound ICMPv4 destination-unreachable or ICMPv6 error (types 1-3) that quotes a
+/// TCP packet. Returns (ICMP header offset, quoted TCP header offset, quoted source address,
+/// quoted source port, quoted destination).
+fn icmp_quote(b: &[u8]) -> Option<(usize, usize, IpAddr, u16, SocketAddr)> {
+    // outer header
+    let (v6, l4) = match b.first()? >> 4 {
+        4 => {
+            if b.len() < 20 || b[9] != 1 || u16::from_be_bytes([b[6], b[7]]) & 0x3fff != 0 {
+                return None;
+            }
+            (false, ((b[0] & 0x0f) as usize) * 4)
+        }
+        6 => {
+            if b.len() < 40 {
+                return None;
+            }
+            let (mut next, mut off) = (b[6], 40);
+            while matches!(next, 0 | 43 | 60) {
+                if b.len() < off + 8 {
+                    return None;
+                }
+                next = b[off];
+                off += (b[off + 1] as usize + 1) * 8;
+            }
+            if next != 58 {
+                return None;
+            }
+            (true, off)
+        }
+        _ => return None,
+    };
+    if l4 < 20 || b.len() < l4 + 8 {
+        return None;
+    }
+    let ty = b[l4];
+    let is_error = if v6 { (1..=3).contains(&ty) } else { ty == 3 };
+    if !is_error {
+        return None;
+    }
+    // quoted packet: what this machine sent (local -> remote)
+    let q = l4 + 8;
+    let (src, dst, tcp) = if v6 {
+        if b.len() < q + 40 || b[q] >> 4 != 6 || b[q + 6] != 6 {
+            return None;
+        }
+        let s: [u8; 16] = b[q + 8..q + 24].try_into().ok()?;
+        let d: [u8; 16] = b[q + 24..q + 40].try_into().ok()?;
+        (IpAddr::V6(Ipv6Addr::from(s)), IpAddr::V6(Ipv6Addr::from(d)), q + 40)
+    } else {
+        if b.len() < q + 20 || b[q] >> 4 != 4 || b[q + 9] != 6 {
+            return None;
+        }
+        let ihl = ((b[q] & 0x0f) as usize) * 4;
+        if ihl < 20 {
+            return None;
+        }
+        let s = IpAddr::V4(Ipv4Addr::new(b[q + 12], b[q + 13], b[q + 14], b[q + 15]));
+        let d = IpAddr::V4(Ipv4Addr::new(b[q + 16], b[q + 17], b[q + 18], b[q + 19]));
+        (s, d, q + ihl)
+    };
+    if b.len() < tcp + 4 {
+        return None;
+    }
+    let sport = u16::from_be_bytes([b[tcp], b[tcp + 1]]);
+    let dport = u16::from_be_bytes([b[tcp + 2], b[tcp + 3]]);
+    Some((l4, tcp, src, sport, SocketAddr::new(dst, dport)))
 }
 
 /// RFC 1624 eqn. 3: HC' = ~(~HC + ~m + m').
@@ -283,6 +389,9 @@ struct Conn<C> {
     last_at: u64,
     pkts_in: u64,
     pkts_out: u64,
+    /// Loosely tracked next sequence numbers (highest seen) of the local and remote side.
+    snd_next: u32,
+    rcv_next: u32,
 }
 
 pub struct Redial<C: Clone> {
@@ -388,17 +497,45 @@ impl<C: Clone> Redial<C> {
                 last_at: now,
                 pkts_in: 0,
                 pkts_out: 0,
+                snd_next: v.seq.wrapping_add(1),
+                rcv_next: 0,
             },
         );
     }
 
-    /// An inbound TCP packet: everything to the alternate port range, and SYN-ACKs to any
-    /// port. Idempotent: a packet this machine already translated passes unchanged.
-    /// `csum_valid` is the capture's TCPChecksum flag. `ctx` is the packet's context; RSTs
-    /// derived from it are emitted with it (the engine flips the direction).
+    /// An inbound packet: TCP to the alternate port range, SYN-ACKs and refusing RSTs to any
+    /// port, and ICMP/ICMPv6 errors. Idempotent: a packet this machine already translated
+    /// passes unchanged. `csum_valid` is the capture's TCPChecksum flag. `ctx` is the packet's
+    /// context; RSTs derived from it are emitted with it (the engine sends them outbound).
     pub fn inbound(&mut self, buf: &mut [u8], csum_valid: bool, ctx: &C, now: u64, out: &mut Vec<Action<C>>) -> Verdict {
-        let Some(v) = tcp_view(buf) else { return Verdict::Pass };
+        let Some(v) = tcp_view(buf) else { return self.icmp_error(buf) };
         let local: Key = (v.dst.ip(), v.dst.port(), v.src);
+
+        // A RST answering a tracked SYN (port closed): the connection is refused. On an
+        // alternate it is the first answer too, so it reaches the application on its port.
+        if v.flags & (TCP_RST | TCP_ACK | TCP_SYN) == TCP_RST | TCP_ACK {
+            let orig = self.alts.get(&local).copied().unwrap_or(local);
+            if let Some(c) = self.conns.get(&orig) {
+                if c.state == State::Pending && v.ack == c.isn.wrapping_add(1) {
+                    self.stats.refused += 1;
+                    if !c.alts.is_empty() {
+                        out.push(Action::Event(Event::Refused {
+                            remote: v.src,
+                            lport: orig.1,
+                            port: local.1,
+                            after_ms: now.saturating_sub(c.first_at),
+                            alternates: c.alts.len(),
+                        }));
+                    }
+                    self.remove(&orig, now, "refused", out);
+                    if orig != local {
+                        rewrite_port(buf, &v, false, orig.1, csum_valid);
+                        return Verdict::Modified;
+                    }
+                    return Verdict::Pass;
+                }
+            }
+        }
 
         if let Some(orig) = self.alts.get(&local).copied() {
             let Some(c) = self.conns.get_mut(&orig) else {
@@ -415,6 +552,7 @@ impl<C: Clone> Redial<C> {
                         c.state = State::Won { port: a, isn: v.seq, at: now };
                         c.last_at = now;
                         c.pkts_in += 1;
+                        c.rcv_next = v.seq.wrapping_add(1);
                         self.stats.redialed += 1;
                         self.stats.mapped += 1;
                         self.stats.translated_in += 1;
@@ -445,7 +583,9 @@ impl<C: Clone> Redial<C> {
                 State::Won { port, .. } if port == a => {
                     c.last_at = now;
                     c.pkts_in += 1;
-                    track_close(c, v.flags, true, now);
+                    if !track_close(c, &v, true, now) {
+                        self.stats.rst_ignored += 1;
+                    }
                     self.stats.translated_in += 1;
                     rewrite_port(buf, &v, false, orig.1, csum_valid);
                     Verdict::Modified
@@ -492,22 +632,61 @@ impl<C: Clone> Redial<C> {
     }
 
     /// An outbound TCP packet seen by the dynamic capture: translate P->A for flows won by an
-    /// alternate. Idempotent (a packet already on A passes unchanged).
-    pub fn outbound(&mut self, buf: &mut [u8], csum_valid: bool, now: u64) -> Verdict {
+    /// alternate. Idempotent (a packet already on A passes unchanged). A SYN is never
+    /// translated: a SYN with a new ISN on a translated key is a new connection reusing the
+    /// local port, so the old translation ends here and the SYN passes on P (the logic capture
+    /// then tracks it as new).
+    pub fn outbound(&mut self, buf: &mut [u8], csum_valid: bool, now: u64, out: &mut Vec<Action<C>>) -> Verdict {
         let Some(v) = tcp_view(buf) else { return Verdict::Pass };
         let key = (v.src.ip(), v.src.port(), v.dst);
         let Some(c) = self.conns.get_mut(&key) else { return Verdict::Pass };
+        if v.is_syn() {
+            if c.isn != v.seq {
+                self.remove(&key, now, "reused", out);
+            }
+            return Verdict::Pass;
+        }
         match c.state {
             State::Won { port, .. } if port != key.1 => {
                 c.last_at = now;
                 c.pkts_out += 1;
-                track_close(c, v.flags, false, now);
+                if !track_close(c, &v, false, now) {
+                    self.stats.rst_ignored += 1;
+                }
                 self.stats.translated_out += 1;
                 rewrite_port(buf, &v, true, port, csum_valid);
                 Verdict::Modified
             }
             _ => Verdict::Pass,
         }
+    }
+
+    /// An inbound ICMP/ICMPv6 error quoting a packet of a translated flow (sent from A):
+    /// rewrite the quoted source port to P so that the stack applies it (path MTU discovery)
+    /// to the application's connection. Everything else passes untouched.
+    pub fn icmp_error(&mut self, b: &mut [u8]) -> Verdict {
+        let Some((l4, tcp, local, sport, remote)) = icmp_quote(b) else { return Verdict::Pass };
+        let Some(orig) = self.alts.get(&(local, sport, remote)).copied() else { return Verdict::Pass };
+        match self.conns.get(&orig).map(|c| c.state) {
+            Some(State::Won { port, .. }) if port == sport => {}
+            _ => return Verdict::Pass,
+        }
+        let p = orig.1;
+        let ck = l4 + 2;
+        let mut icmp_ck = u16::from_be_bytes([b[ck], b[ck + 1]]);
+        b[tcp..tcp + 2].copy_from_slice(&p.to_be_bytes());
+        icmp_ck = csum_update16(icmp_ck, sport, p);
+        // The quoted TCP checksum, when the quote is long enough to hold it.
+        if b.len() >= tcp + 18 {
+            let t = tcp + 16;
+            let old = u16::from_be_bytes([b[t], b[t + 1]]);
+            let new = csum_update16(old, sport, p);
+            b[t..t + 2].copy_from_slice(&new.to_be_bytes());
+            icmp_ck = csum_update16(icmp_ck, old, new);
+        }
+        b[ck..ck + 2].copy_from_slice(&icmp_ck.to_be_bytes());
+        self.stats.icmp_translated += 1;
+        Verdict::Modified
     }
 
     fn reset_loser(&mut self, buf: &[u8], v: &TcpView, lport: u16, ctx: &C, out: &mut Vec<Action<C>>) {
@@ -647,24 +826,56 @@ impl<C: Clone> Redial<C> {
     }
 }
 
-fn track_close<C>(c: &mut Conn<C>, flags: u8, inbound: bool, now: u64) {
-    if c.closed.is_some() {
-        return;
-    }
-    if flags & TCP_RST != 0 {
-        c.closed = Some((now, "rst"));
-        return;
-    }
-    if flags & TCP_FIN != 0 {
-        if inbound {
-            c.fin_in = true;
-        } else {
-            c.fin_out = true;
+/// After a RST, outbound traffic this long afterwards proves the local stack did not accept it.
+pub const RST_CANCEL_MS: u64 = 1000;
+
+/// Follow sequence numbers and close signals of a translated flow. Returns `false` for a RST
+/// that was ignored as implausible.
+///
+/// - A RST starts the close linger only when its sequence number is near the sender's tracked
+///   next sequence number (the stack would ignore one far away, so must we).
+/// - A pending RST close is cancelled when the local side keeps sending (non-RST) at least
+///   [`RST_CANCEL_MS`] later: a stack that accepted the RST sends nothing more.
+/// - FIN close needs a plausible FIN in both directions; later new payload in either
+///   direction cancels it.
+fn track_close<C>(c: &mut Conn<C>, v: &TcpView, inbound: bool, now: u64) -> bool {
+    let next = if inbound { c.rcv_next } else { c.snd_next };
+    let plausible = seq_plausible(v.seq, next);
+    if v.flags & TCP_RST != 0 {
+        if !plausible {
+            return false;
         }
-        if c.fin_in && c.fin_out {
-            c.closed = Some((now, "fin"));
+        if c.closed.is_none() {
+            c.closed = Some((now, "rst"));
+        }
+        return true;
+    }
+    if let Some((t, why)) = c.closed {
+        let alive = match why {
+            "rst" => !inbound && now.saturating_sub(t) >= RST_CANCEL_MS,
+            // New payload (not a retransmission) after both FINs.
+            _ => v.payload_len > 0 && (v.seq.wrapping_add(v.seg_len()).wrapping_sub(next) as i32) > 0,
+        };
+        if alive {
+            c.closed = None;
+            c.fin_in = false;
+            c.fin_out = false;
         }
     }
+    if plausible {
+        seq_advance(if inbound { &mut c.rcv_next } else { &mut c.snd_next }, v);
+        if v.flags & TCP_FIN != 0 {
+            if inbound {
+                c.fin_in = true;
+            } else {
+                c.fin_out = true;
+            }
+            if c.fin_in && c.fin_out && c.closed.is_none() {
+                c.closed = Some((now, "fin"));
+            }
+        }
+    }
+    true
 }
 
 /// The same SYN from source port `port`, checksums recomputed.
@@ -715,7 +926,7 @@ mod tests {
     }
     fn outb(r: &mut Redial<u32>, p: &Packet, now: u64) -> (Verdict, Packet) {
         let mut b = p.as_bytes().to_vec();
-        let v = r.outbound(&mut b, true, now);
+        let v = r.outbound(&mut b, true, now, &mut Vec::new());
         (v, Packet::parse(b).unwrap())
     }
     /// Track a SYN at t=0 and stall until one alternate is out; returns the alternate port.
@@ -845,7 +1056,7 @@ mod tests {
         let l4 = 20;
         b[l4 + 16] = 0x12; // offload leaves a partial / arbitrary value
         b[l4 + 17] = 0x34;
-        assert_eq!(r.outbound(&mut b, false, 330), Verdict::Modified);
+        assert_eq!(r.outbound(&mut b, false, 330, &mut Vec::new()), Verdict::Modified);
         assert_eq!(u16::from_be_bytes([b[l4], b[l4 + 1]]), a);
         assert_eq!(&b[l4 + 16..l4 + 18], &[0x12, 0x34]);
     }
@@ -1120,5 +1331,267 @@ mod tests {
         }
         let v = tcp_view(t.as_bytes()).unwrap();
         assert!(v.is_syn() && !v.is_synack());
+        let d = tcp4(ME, P, CF, 443, 1, 2, TCP_ACK | TCP_FIN, b"12345");
+        let v = tcp_view(d.as_bytes()).unwrap();
+        assert_eq!((v.payload_len, v.seg_len()), (5, 6));
+    }
+
+    // ---- review fixes ----------------------------------------------------------------------
+
+    /// Engine order: dyn-out (`outbound`) sees an outbound SYN before logic (`outbound_syn`).
+    #[test]
+    fn new_syn_on_translated_port_ends_old_translation() {
+        let mut r = r();
+        let a = won_by_alt(&mut r);
+        let new_isn = 5_000_000;
+        let new_syn = tcp4(ME, P, CF, 443, new_isn, 0, TCP_SYN, b"");
+        let mut b = new_syn.as_bytes().to_vec();
+        let mut out = Vec::new();
+        assert_eq!(r.outbound(&mut b, true, 60_000, &mut out), Verdict::Pass);
+        assert_eq!(b, new_syn.as_bytes(), "the new SYN leaves on P, untouched");
+        assert!(events(&out).iter().any(|e| matches!(e, Event::MapClosed { reason: "reused", .. })));
+        assert_eq!(r.stats().mapped, 0);
+        r.outbound_syn(&b, &1, 60_000, &mut out);
+        assert_eq!(r.stats().syns, 2, "tracked as a new connection");
+        // Its SYN-ACK on P is the normal case; the old alternate port is free again.
+        let sa = tcp4(CF, 443, ME, P, 4242, new_isn + 1, TCP_SYN | TCP_ACK, b"");
+        assert_eq!(inb(&mut r, &sa, 60_080, &mut out).0, Verdict::Pass);
+        assert_eq!(r.tracked(), 0);
+        let stray = tcp4(CF, 443, ME, a, 1, 2, TCP_ACK, b"");
+        assert_eq!(inb(&mut r, &stray, 60_100, &mut out).0, Verdict::Pass);
+        // A retransmitted SYN with the winner's own ISN is not translated either.
+        let mut r2 = Redial::<u32>::new(RedialConfig::default());
+        won_by_alt(&mut r2);
+        let mut b = syn().into_bytes();
+        assert_eq!(r2.outbound(&mut b, true, 400, &mut out), Verdict::Pass);
+        assert_eq!(r2.stats().mapped, 1);
+    }
+
+    #[test]
+    fn implausible_rst_does_not_end_translation() {
+        let mut r = r();
+        let a = won_by_alt(&mut r);
+        let mut out = Vec::new();
+        let rst = tcp4(CF, 443, ME, a, SISN.wrapping_add(0x4000_0000), 0, TCP_RST, b"");
+        let (v, p) = inb(&mut r, &rst, 1000, &mut out);
+        assert_eq!((v, p.dst_port()), (Verdict::Modified, P), "still delivered; the stack ignores it");
+        assert_eq!(r.stats().rst_ignored, 1);
+        for t in (2000..11_000).step_by(500) {
+            let d = tcp4(CF, 443, ME, a, SISN + 1, ISN + 1, TCP_ACK, b"data");
+            assert_eq!(inb(&mut r, &d, t, &mut out).0, Verdict::Modified);
+        }
+        r.tick(11_001, &mut out);
+        let d = tcp4(CF, 443, ME, a, SISN + 5, ISN + 1, TCP_ACK, b"data");
+        assert_eq!(inb(&mut r, &d, 11_002, &mut out).0, Verdict::Modified);
+        assert_eq!(r.stats().mapped, 1);
+    }
+
+    #[test]
+    fn rst_close_is_cancelled_when_the_local_side_keeps_sending() {
+        let mut r = r();
+        let a = won_by_alt(&mut r);
+        let mut out = Vec::new();
+        // In-window RST (e.g. injected by a middlebox) that the local stack did not act on.
+        inb(&mut r, &tcp4(CF, 443, ME, a, SISN + 1, 0, TCP_RST, b""), 1000, &mut out);
+        // Within RST_CANCEL_MS outbound packets may still be in flight: no cancel.
+        outb(&mut r, &tcp4(ME, P, CF, 443, ISN + 1, SISN + 1, TCP_ACK, b"x"), 1500);
+        outb(&mut r, &tcp4(ME, P, CF, 443, ISN + 2, SISN + 1, TCP_ACK, b"y"), 2500);
+        r.tick(20_000, &mut out);
+        assert_eq!(r.stats().mapped, 1, "connection kept its translation");
+        // Without later traffic the RST closes it.
+        let mut r = Redial::<u32>::new(RedialConfig::default());
+        let a = won_by_alt(&mut r);
+        inb(&mut r, &tcp4(CF, 443, ME, a, SISN + 1, 0, TCP_RST, b""), 1000, &mut out);
+        outb(&mut r, &tcp4(ME, P, CF, 443, ISN + 1, SISN + 1, TCP_ACK, b"x"), 1500);
+        r.tick(11_000, &mut out);
+        assert_eq!(r.stats().mapped, 0);
+    }
+
+    #[test]
+    fn fin_close_is_cancelled_by_new_data() {
+        let mut r = r();
+        let a = won_by_alt(&mut r);
+        let mut out = Vec::new();
+        outb(&mut r, &tcp4(ME, P, CF, 443, ISN + 1, SISN + 1, TCP_FIN | TCP_ACK, b""), 1000);
+        inb(&mut r, &tcp4(CF, 443, ME, a, SISN + 1, ISN + 2, TCP_FIN | TCP_ACK, b""), 1100, &mut out);
+        // Retransmitted FIN and a final ACK do not cancel...
+        inb(&mut r, &tcp4(CF, 443, ME, a, SISN + 1, ISN + 2, TCP_FIN | TCP_ACK, b""), 1200, &mut out);
+        outb(&mut r, &tcp4(ME, P, CF, 443, ISN + 2, SISN + 2, TCP_ACK, b""), 1300);
+        r.tick(11_100, &mut out);
+        assert_eq!(r.stats().mapped, 0);
+        // ...new data after both FINs does.
+        let mut r = Redial::<u32>::new(RedialConfig::default());
+        let a = won_by_alt(&mut r);
+        outb(&mut r, &tcp4(ME, P, CF, 443, ISN + 1, SISN + 1, TCP_FIN | TCP_ACK, b""), 1000);
+        inb(&mut r, &tcp4(CF, 443, ME, a, SISN + 1, ISN + 2, TCP_FIN | TCP_ACK, b""), 1100, &mut out);
+        inb(&mut r, &tcp4(CF, 443, ME, a, SISN + 2, ISN + 2, TCP_ACK, b"more"), 1200, &mut out);
+        r.tick(11_100, &mut out);
+        assert_eq!(r.stats().mapped, 1);
+    }
+
+    #[test]
+    fn idle_timeout_outlives_windows_keepalive() {
+        assert!(RedialConfig::default().idle_ms >= 2 * 3600 * 1000 + 15 * 60 * 1000);
+    }
+
+    #[test]
+    fn refused_on_original_port_ends_tracking() {
+        let mut r = r();
+        let mut out = Vec::new();
+        r.outbound_syn(syn().as_bytes(), &1, 0, &mut out);
+        let rst = tcp4(CF, 443, ME, P, 0, ISN + 1, TCP_RST | TCP_ACK, b"");
+        let (v, p) = inb(&mut r, &rst, 60, &mut out);
+        assert_eq!((v, p), (Verdict::Pass, rst.clone()));
+        for t in (0..=1000).step_by(10) {
+            r.tick(t, &mut out);
+        }
+        assert!(sends(&out).is_empty(), "no alternates to a refusing server");
+        assert_eq!(r.stats().refused, 1);
+        assert_eq!(r.tracked(), 0);
+    }
+
+    #[test]
+    fn refused_on_alternate_reaches_the_application_on_its_port() {
+        let mut r = r();
+        let (a, _) = stall_once(&mut r);
+        let mut out = Vec::new();
+        let rst = tcp4(CF, 443, ME, a, 0, ISN + 1, TCP_RST | TCP_ACK, b"");
+        let (v, p) = inb(&mut r, &rst, 300, &mut out);
+        assert_eq!((v, p.dst_port()), (Verdict::Modified, P));
+        assert!(p.l4_checksum_ok());
+        assert!(events(&out).iter().any(|e| matches!(e, Event::Refused { alternates: 1, .. })));
+        assert_eq!(r.tracked(), 0);
+        out.clear();
+        r.tick(2000, &mut out);
+        assert!(sends(&out).is_empty());
+    }
+
+    #[test]
+    fn unrelated_rsts_pass_untouched() {
+        let mut r = r();
+        stall_once(&mut r);
+        let mut out = Vec::new();
+        for p in [
+            tcp4(CF, 443, ME, P, 0, ISN + 7, TCP_RST | TCP_ACK, b""), // wrong ack
+            tcp4(CF, 443, ME, P + 1, 0, ISN + 1, TCP_RST | TCP_ACK, b""), // other port
+            tcp4([8, 8, 8, 8], 443, ME, 50000, 0, 1, TCP_RST | TCP_ACK, b""),
+        ] {
+            let (v, q) = inb(&mut r, &p, 300, &mut out);
+            assert_eq!((v, q), (Verdict::Pass, p.clone()));
+        }
+        assert_eq!(r.tracked(), 1);
+        assert!(out.is_empty());
+    }
+
+    fn ones(data: &[u8], init: u32) -> u16 {
+        let mut s = init;
+        for c in data.chunks(2) {
+            s += (u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)])) as u32;
+        }
+        while s >> 16 != 0 {
+            s = (s & 0xffff) + (s >> 16);
+        }
+        !(s as u16)
+    }
+
+    fn icmp4(quote: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 60, 1, 0, 0, 10, 20, 30, 1, ME[0], ME[1], ME[2], ME[3]];
+        b.extend_from_slice(&[3, 4, 0, 0, 0, 0, 0x05, 0x78]); // frag needed, MTU 1400
+        b.extend_from_slice(quote);
+        let n = b.len() as u16;
+        b[2..4].copy_from_slice(&n.to_be_bytes());
+        let ck = ones(&b[20..], 0);
+        b[22..24].copy_from_slice(&ck.to_be_bytes());
+        let ih = ones(&b[..20], 0);
+        b[10..12].copy_from_slice(&ih.to_be_bytes());
+        b
+    }
+
+    fn icmp6_sum(b: &[u8]) -> u32 {
+        let mut s = 0u32;
+        for c in b[8..40].chunks(2) {
+            s += u16::from_be_bytes([c[0], c[1]]) as u32;
+        }
+        let len = (b.len() - 40) as u32;
+        s + (len >> 16) + (len & 0xffff) + 58
+    }
+
+    fn icmp6(src: Ipv6Addr, dst: Ipv6Addr, quote: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x60, 0, 0, 0, 0, 0, 58, 60];
+        b.extend_from_slice(&src.octets());
+        b.extend_from_slice(&dst.octets());
+        b.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0x05, 0x00]); // packet too big, MTU 1280
+        b.extend_from_slice(quote);
+        let n = (b.len() - 40) as u16;
+        b[4..6].copy_from_slice(&n.to_be_bytes());
+        let ck = ones(&b[40..], icmp6_sum(&b));
+        b[42..44].copy_from_slice(&ck.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn icmp_errors_about_translated_flows_are_rewritten_to_the_original_port() {
+        let mut r = r();
+        let a = won_by_alt(&mut r);
+        let sent = tcp4(ME, a, CF, 443, ISN + 1, SISN + 1, TCP_ACK | TCP_PSH, &[7u8; 1300]);
+        let mut out = Vec::new();
+        // Full quote (TCP checksum present) and RFC 792 minimum (IP header + 8 bytes).
+        for qlen in [20 + 20 + 16, 20 + 8, 20 + 20] {
+            let mut b = icmp4(&sent.as_bytes()[..qlen]);
+            assert_eq!(r.inbound(&mut b, true, &9, 500, &mut out), Verdict::Modified, "quote {qlen}");
+            assert_eq!(u16::from_be_bytes([b[48], b[49]]), P);
+            assert_eq!(ones(&b[20..], 0), 0, "ICMP checksum valid");
+            assert_eq!(ones(&b[..20], 0), 0, "outer IP header untouched");
+        }
+        assert_eq!(r.stats().icmp_translated, 3);
+        // Quoted TCP checksum kept consistent: equals that of the packet sent from P.
+        let mut b = icmp4(&sent.as_bytes()[..20 + 20]);
+        r.inbound(&mut b, true, &9, 500, &mut out);
+        let mut from_p = sent.clone();
+        from_p.set_src_port(P);
+        from_p.fix_checksums();
+        assert_eq!(&b[28 + 36..28 + 38], &from_p.as_bytes()[36..38]);
+        // Not about a translated flow, or not an error type: untouched.
+        let other = tcp4(ME, P, CF, 443, 1, 2, TCP_ACK, b"");
+        let echo_reply = {
+            let mut e = icmp4(&sent.as_bytes()[..28]);
+            e[20] = 0;
+            e
+        };
+        for mut b in [icmp4(&other.as_bytes()[..28]), icmp4(&tcp4(ME, a, [1, 1, 1, 1], 443, 1, 2, TCP_ACK, b"").as_bytes()[..28]), echo_reply] {
+            let before = b.clone();
+            assert_eq!(r.inbound(&mut b, true, &9, 500, &mut out), Verdict::Pass);
+            assert_eq!(b, before);
+        }
+        // Garbage and truncation never panic.
+        let full = icmp4(&sent.as_bytes()[..56]);
+        for n in 0..full.len() {
+            let mut b = full[..n].to_vec();
+            let _ = r.inbound(&mut b, true, &9, 500, &mut out);
+        }
+    }
+
+    #[test]
+    fn icmpv6_packet_too_big_is_rewritten() {
+        let me: Ipv6Addr = "2a02:e0:1::5".parse().unwrap();
+        let cf: Ipv6Addr = "2606:4700::6810:84e5".parse().unwrap();
+        let router: Ipv6Addr = "2a02:e0::1".parse().unwrap();
+        let mut r = r();
+        let mut out = Vec::new();
+        r.outbound_syn(tcp6(me, P, cf, 443, ISN, 0, TCP_SYN, b"").as_bytes(), &1, 0, &mut out);
+        r.tick(250, &mut out);
+        let a = sends(&out)[0].src_port();
+        inb(&mut r, &tcp6(cf, 443, me, a, SISN, ISN + 1, TCP_SYN | TCP_ACK, b""), 300, &mut out);
+        let sent = tcp6(me, a, cf, 443, ISN + 1, SISN + 1, TCP_ACK, &[1u8; 1400]);
+        let mut b = icmp6(router, me, &sent.as_bytes()[..1232]);
+        assert_eq!(r.inbound(&mut b, true, &9, 400, &mut out), Verdict::Modified);
+        assert_eq!(u16::from_be_bytes([b[88], b[89]]), P);
+        assert_eq!(ones(&b[40..], icmp6_sum(&b)), 0, "ICMPv6 checksum valid");
+        // Echo reply (type 129) passes.
+        let mut e = icmp6(router, me, &sent.as_bytes()[..100]);
+        e[40] = 129;
+        let before = e.clone();
+        assert_eq!(r.inbound(&mut e, true, &9, 400, &mut out), Verdict::Pass);
+        assert_eq!(e, before);
     }
 }

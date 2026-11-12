@@ -15,14 +15,14 @@
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6">
   <img alt="Dil" src="https://img.shields.io/badge/dil-Rust-b7410e">
   <img alt="Lisans" src="https://img.shields.io/badge/lisans-MIT-2ea44f">
-  <img alt="Testler" src="https://img.shields.io/badge/birim%20testi-104%20ge%C3%A7iyor-2ea44f">
+  <img alt="Testler" src="https://img.shields.io/badge/birim%20testi-118%20ge%C3%A7iyor-2ea44f">
   <img alt="Sürüm" src="https://img.shields.io/github/v/release/uruskan/SONdpi?include_prereleases&label=s%C3%BCr%C3%BCm">
   <img alt="Terminal" src="https://img.shields.io/badge/terminal-gerekmez-8250df">
   <img alt="Baba" src="https://img.shields.io/badge/babayla-yar%C4%B1%C5%9F%C4%B1lmaz-ff69b4">
 </p>
 
 > [!WARNING]
-> **Erken sürüm.** Motor 104 birim testinden geçiyor, ama gerçek hattaki sınaması henüz tamamlanmadı. Hat ölçümleri şu an yalnızca Turkcell 5G ev internetinde yapıldı; başka servis sağlayıcılarda denenmedi. Bozuk bir şey görürsen [sorun aç](https://github.com/uruskan/SONdpi/issues).
+> **Erken sürüm.** Motor 118 birim testinden geçiyor, ama gerçek hattaki sınaması henüz tamamlanmadı. Hat ölçümleri şu an yalnızca Turkcell 5G ev internetinde yapıldı; başka servis sağlayıcılarda denenmedi. Bozuk bir şey görürsen [sorun aç](https://github.com/uruskan/SONdpi/issues).
 
 ## Neden var
 

@@ -29,7 +29,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -112,42 +112,138 @@ pub struct EngineStats {
     pub dyn_addrs: u64,
     pub dyn_all: bool,
     pub dyn_reopens: u64,
+    /// Tracked SYNs refused by the server (RST), tracking ended without alternates.
+    pub refused: u64,
+    /// ICMP errors about translated flows rewritten to the application's port.
+    pub icmp_translated: u64,
+    /// Implausible RSTs on translated flows that did not end the translation.
+    pub rst_ignored: u64,
+    /// Log lines dropped because the log queue was full.
+    pub log_dropped: u64,
 }
 
 // ---- logging ------------------------------------------------------------------------------
 
+/// Lines queued for the log writer before new ones are dropped (and counted).
+pub const LOG_QUEUE: usize = 4096;
+
+enum LogMsg {
+    Line(String),
+    Flush(mpsc::Sender<()>),
+}
+
 /// Timestamped line log to a file and optionally stdout. Cheap to clone.
+///
+/// `line` never blocks: lines go through a bounded queue to a writer thread, so a stalled
+/// stdout (console selection, a full pipe) or a slow disk cannot hold up packet threads.
+/// When the queue is full the line is dropped and counted; the writer reports the count.
 #[derive(Clone)]
 pub struct Logger {
-    inner: Arc<Mutex<(Option<File>, bool)>>,
+    tx: Option<mpsc::SyncSender<LogMsg>>,
+    dropped: Arc<AtomicU64>,
+}
+
+/// File plus optional stdout echo.
+struct FileEcho {
+    file: Option<File>,
+    echo: bool,
+}
+
+impl Write for FileEcho {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        if self.echo {
+            let mut o = io::stdout().lock();
+            let _ = o.write_all(b);
+            let _ = o.flush();
+        }
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.write_all(b);
+        }
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.flush();
+        }
+        Ok(())
+    }
 }
 
 impl Logger {
     pub fn none() -> Logger {
-        Logger { inner: Arc::new(Mutex::new((None, false))) }
+        Logger { tx: None, dropped: Arc::new(AtomicU64::new(0)) }
     }
     /// Append to `path` (created if missing); `echo` also prints every line to stdout.
     pub fn open(path: Option<&Path>, echo: bool) -> io::Result<Logger> {
-        let f = match path {
+        let file = match path {
             Some(p) => Some(OpenOptions::new().create(true).append(true).open(p)?),
             None => None,
         };
-        Ok(Logger { inner: Arc::new(Mutex::new((f, echo))) })
+        if file.is_none() && !echo {
+            return Ok(Logger::none());
+        }
+        Logger::with_sink(Box::new(FileEcho { file, echo }), LOG_QUEUE)
+    }
+    /// Log to any writer through a queue of `cap` lines.
+    pub fn with_sink(mut sink: Box<dyn Write + Send>, cap: usize) -> io::Result<Logger> {
+        let (tx, rx) = mpsc::sync_channel::<LogMsg>(cap.max(1));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let d = dropped.clone();
+        thread::Builder::new().name("sondpi-log".into()).spawn(move || {
+            let mut reported = 0u64;
+            while let Ok(m) = rx.recv() {
+                let lost = d.load(Relaxed);
+                if lost > reported {
+                    let _ = sink.write_all(format!("{} ({} log lines dropped: queue full)\n", timestamp(), lost - reported).as_bytes());
+                    reported = lost;
+                }
+                match m {
+                    LogMsg::Line(s) => {
+                        let _ = sink.write_all(s.as_bytes());
+                    }
+                    LogMsg::Flush(done) => {
+                        let _ = sink.flush();
+                        let _ = done.send(());
+                    }
+                }
+            }
+            let _ = sink.flush();
+        })?;
+        Ok(Logger { tx: Some(tx), dropped })
     }
     pub fn enabled(&self) -> bool {
-        let g = lock(&self.inner);
-        g.0.is_some() || g.1
+        self.tx.is_some()
     }
+    /// Lines dropped so far because the queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Relaxed)
+    }
+    /// Queue one line; never blocks.
     pub fn line(&self, s: &str) {
+        let Some(tx) = &self.tx else { return };
         let line = format!("{} {}\n", timestamp(), s);
-        let mut g = lock(&self.inner);
-        if g.1 {
-            print!("{line}");
-            let _ = io::stdout().flush();
+        if tx.try_send(LogMsg::Line(line)).is_err() {
+            self.dropped.fetch_add(1, Relaxed);
         }
-        if let Some(f) = g.0.as_mut() {
-            let _ = f.write_all(line.as_bytes());
+    }
+    /// Wait (up to `timeout`) until every line queued so far is written. For shutdown paths,
+    /// never for packet threads.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let Some(tx) = &self.tx else { return true };
+        let (dtx, drx) = mpsc::channel();
+        let deadline = Instant::now() + timeout;
+        let mut msg = LogMsg::Flush(dtx);
+        loop {
+            match tx.try_send(msg) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(m)) if Instant::now() < deadline => {
+                    msg = m;
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return false,
+            }
         }
+        drx.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_ok()
     }
 }
 
@@ -180,12 +276,15 @@ pub fn logic_filter(desync_on: bool, desync_filter: &str, redial_on: bool, dns_o
     if desync_on && !df.is_empty() && df != "false" {
         parts.push(format!("(outbound and tcp and ({df}))"));
     }
-    if redial_on {
-        parts.push("(outbound and tcp.Syn and !tcp.Ack)".into());
-    }
     if redial_on || desync_on {
-        // SYN-ACKs: re-dial winner/loser decisions and the desync flow hint (server TTL).
+        // SYNs: re-dial tracking, and the client's MSS for the desync chunk size.
+        parts.push("(outbound and tcp.Syn and !tcp.Ack)".into());
+        // SYN-ACKs: re-dial winner/loser decisions and the desync flow hint (server TTL, MSS).
         parts.push("(inbound and tcp.Syn and tcp.Ack)".into());
+    }
+    if redial_on {
+        // RST answering a SYN (<SEQ=0><ACK=ISN+1><CTL=RST,ACK>, RFC 793): connection refused.
+        parts.push("(inbound and tcp.Rst and tcp.Ack and tcp.SeqNum == 0)".into());
     }
     if dns_on {
         parts.push("(outbound and udp.DstPort == 53)".into());
@@ -196,9 +295,13 @@ pub fn logic_filter(desync_on: bool, desync_filter: &str, redial_on: bool, dns_o
     Some(format!("!loopback and ({})", parts.join(" or ")))
 }
 
-/// Inbound TCP to the alternate port range.
+/// Inbound TCP to the alternate port range, plus inbound ICMP destination-unreachable and
+/// ICMPv6 error messages (types 1-3, Packet Too Big included) so that errors about translated
+/// flows can be rewritten to the application's port. Other ICMP passes the driver untouched.
 pub fn alt_in_filter(lo: u16, hi: u16) -> String {
-    format!("inbound and !loopback and tcp and tcp.DstPort >= {lo} and tcp.DstPort <= {hi}")
+    format!(
+        "inbound and !loopback and ((tcp and tcp.DstPort >= {lo} and tcp.DstPort <= {hi}) or icmp.Type == 3 or (icmpv6.Type >= 1 and icmpv6.Type <= 3))"
+    )
 }
 
 /// Outbound TCP to `addrs`; `None` when there are too many for one filter.
@@ -221,11 +324,28 @@ pub const DYN_ALL_FILTER: &str = "outbound and !loopback and tcp";
 
 // ---- flow hints ----------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+/// What the engine learned from a connection's handshake.
+#[derive(Clone, Copy, Default)]
 struct Hint {
-    ttl: u8,
-    mss: Option<u16>,
+    /// TTL of the server's SYN-ACK.
+    ttl: Option<u8>,
+    /// MSS the server announced (what it accepts).
+    server_mss: Option<u16>,
+    /// MSS this machine announced in its SYN (reflects the local interface MTU).
+    client_mss: Option<u16>,
     at: u64,
+}
+
+/// Largest payload one desync chunk may carry: the smaller of the two announced MSS values
+/// when both are known, else whichever is known. A server MSS above the local one would
+/// produce segments the local path cannot carry; a local MSS above the server's would be
+/// segments the server refuses to accept unsegmented.
+pub fn max_payload(client_mss: Option<u16>, server_mss: Option<u16>) -> Option<u16> {
+    let ok = |m: Option<u16>| m.filter(|&v| v >= 64);
+    match (ok(client_mss), ok(server_mss)) {
+        (Some(c), Some(s)) => Some(c.min(s)),
+        (c, s) => c.or(s),
+    }
 }
 
 const HINT_CAP: usize = 8192;
@@ -237,14 +357,17 @@ struct Hints {
 }
 
 impl Hints {
-    fn insert(&mut self, local: SocketAddr, remote: SocketAddr, h: Hint) {
-        if self.map.len() >= HINT_CAP {
-            self.expire(h.at, HINT_TTL_MS / 4);
+    /// Update the entry for (local, remote) in place, creating it when missing.
+    fn update(&mut self, local: SocketAddr, remote: SocketAddr, now: u64, f: impl FnOnce(&mut Hint)) {
+        if self.map.len() >= HINT_CAP && !self.map.contains_key(&(local, remote)) {
+            self.expire(now, HINT_TTL_MS / 4);
             if self.map.len() >= HINT_CAP {
                 self.map.clear();
             }
         }
-        self.map.insert((local, remote), h);
+        let h = self.map.entry((local, remote)).or_default();
+        h.at = now;
+        f(h);
     }
     fn expire(&mut self, now: u64, max_age: u64) {
         self.map.retain(|_, h| now.saturating_sub(h.at) < max_age);
@@ -393,6 +516,9 @@ impl Shared {
             }
             Event::LoserReset { remote, lport, port } => format!("redial loser-rst {remote} lport={lport} port={port}"),
             Event::GaveUp { remote, lport, alternates } => format!("redial gave-up {remote} lport={lport} alts={alternates}"),
+            Event::Refused { remote, lport, port, after_ms, alternates } => {
+                format!("redial refused {remote} lport={lport} rst-on={port} after={after_ms}ms alts={alternates}")
+            }
             Event::MapClosed { remote, lport, alt, reason, pkts_in, pkts_out, age_ms } => {
                 format!("map close {remote} {lport}<->{alt} reason={reason} age={age_ms}ms in={pkts_in} out={pkts_out}")
             }
@@ -442,9 +568,13 @@ fn logic_loop(sh: &Arc<Shared>, h: Arc<Divert>, dns: Option<Arc<DnsResponder<Add
                     let now = sh.now();
                     lock(&sh.redial).outbound_syn(pkt, &addr, now, &mut acts);
                 }
+                if sh.cfg.desync {
+                    record_hint(sh, pkt, true);
+                }
                 sh.send(&h, pkt, &addr);
                 sh.run_actions(&mut acts);
-            } else if !outbound && v.is_synack() {
+            } else if !outbound {
+                // SYN-ACKs and refusing RSTs.
                 let verdict = if sh.cfg.redial {
                     let now = sh.now();
                     lock(&sh.redial).inbound(pkt, addr.tcp_checksum(), &addr, now, &mut acts)
@@ -452,13 +582,13 @@ fn logic_loop(sh: &Arc<Shared>, h: Arc<Divert>, dns: Option<Arc<DnsResponder<Add
                     RVerdict::Pass
                 };
                 if verdict != RVerdict::Drop {
-                    if sh.cfg.desync {
-                        record_hint(sh, pkt);
+                    if sh.cfg.desync && v.is_synack() {
+                        record_hint(sh, pkt, false);
                     }
                     sh.send(&h, pkt, &addr);
                 }
                 sh.run_actions(&mut acts);
-            } else if outbound && sh.cfg.desync {
+            } else if sh.cfg.desync {
                 desync_one(sh, &h, pkt, &addr);
             } else {
                 sh.send(&h, pkt, &addr);
@@ -482,10 +612,21 @@ fn logic_loop(sh: &Arc<Shared>, h: Arc<Divert>, dns: Option<Arc<DnsResponder<Add
     Ok(())
 }
 
-fn record_hint(sh: &Shared, pkt: &[u8]) {
+/// Remember handshake facts: from our SYN (`outbound`) the client MSS, from the SYN-ACK the
+/// server TTL and MSS. Keyed by (local, remote) on the application's port.
+fn record_hint(sh: &Shared, pkt: &[u8], outbound: bool) {
     let Some(p) = Packet::parse(pkt.to_vec()) else { return };
-    let h = Hint { ttl: p.ttl(), mss: mss_option(&p), at: sh.now() };
-    lock(&sh.hints).insert(p.dst(), p.src(), h);
+    let mss = mss_option(&p);
+    let now = sh.now();
+    if outbound {
+        lock(&sh.hints).update(p.src(), p.dst(), now, |h| h.client_mss = mss);
+    } else {
+        let ttl = p.ttl();
+        lock(&sh.hints).update(p.dst(), p.src(), now, |h| {
+            h.ttl = Some(ttl);
+            h.server_mss = mss;
+        });
+    }
 }
 
 fn flow_hint(sh: &Shared, p: &Packet) -> FlowHint {
@@ -497,9 +638,27 @@ fn flow_hint(sh: &Shared, p: &Packet) -> FlowHint {
             h = lock(&sh.hints).map.get(&(SocketAddr::new(local.ip(), op), remote)).copied();
         }
     }
+    hint_to_flow(h)
+}
+
+fn hint_to_flow(h: Option<Hint>) -> FlowHint {
     match h {
-        Some(h) => FlowHint { server_ttl: Some(h.ttl), max_payload: h.mss },
+        Some(h) => FlowHint { server_ttl: h.ttl, max_payload: max_payload(h.client_mss, h.server_mss) },
         None => FlowHint::default(),
+    }
+}
+
+/// The packet to inject for a DNS outcome and its direction (`true`: outbound). The fallback
+/// is the captured query itself, whose checksums may be offload placeholders (its captured
+/// address had the checksum flags unset), so they are recomputed before it is re-sent with
+/// the flags set.
+pub fn dns_outcome_packet(o: DnsOutcome) -> (Packet, bool) {
+    match o {
+        DnsOutcome::Reply(p) => (p, false),
+        DnsOutcome::Fallback(mut p) => {
+            p.fix_checksums();
+            (p, true)
+        }
     }
 }
 
@@ -565,12 +724,14 @@ fn alt_in_loop(sh: &Arc<Shared>, h: Arc<Divert>) -> io::Result<()> {
 
 fn dyn_out_loop(sh: &Arc<Shared>, h: Arc<Divert>) -> io::Result<()> {
     let mut buf = vec![0u8; MTU_MAX];
+    let mut acts: Vec<Action<Addr>> = Vec::new();
     while let Some((n, addr)) = recv_one(&h, &mut buf)? {
         sh.c.captured.fetch_add(1, Relaxed);
         let pkt = &mut buf[..n];
         let now = sh.now();
-        let _ = lock(&sh.redial).outbound(pkt, addr.tcp_checksum(), now);
+        let _ = lock(&sh.redial).outbound(pkt, addr.tcp_checksum(), now, &mut acts);
         sh.send(&h, pkt, &addr);
+        sh.run_actions(&mut acts);
     }
     Ok(())
 }
@@ -741,6 +902,7 @@ impl Engine {
         let r = Engine::try_start(cfg, log.clone());
         if let Err(e) = &r {
             log.line(&format!("engine start FAILED: {e}"));
+            log.flush(Duration::from_secs(2));
         }
         r
     }
@@ -803,11 +965,11 @@ impl Engine {
 
         let dns = if sh.cfg.dns {
             let s = sh.clone();
-            let cb: Box<dyn Fn(DnsOutcome, Addr) + Send + Sync> = Box::new(move |o, ctx| match o {
-                // Inbound on the interface the query left from, as if the server answered.
-                DnsOutcome::Reply(p) => s.originate(p.as_bytes(), ctx, false),
-                // Below the logic handle, so it is not captured again.
-                DnsOutcome::Fallback(p) => s.originate(p.as_bytes(), ctx, true),
+            // A reply goes inbound on the interface the query left from, as if the server
+            // answered; a fallback goes back out below the logic handle (not captured again).
+            let cb: Box<dyn Fn(DnsOutcome, Addr) + Send + Sync> = Box::new(move |o, ctx| {
+                let (p, outbound) = dns_outcome_packet(o);
+                s.originate(p.as_bytes(), ctx, outbound);
             });
             Some(Arc::new(DnsResponder::new(sh.cfg.dns_cfg.clone(), cb)))
         } else {
@@ -869,6 +1031,10 @@ impl Engine {
             dyn_addrs: c.dyn_addrs.load(Relaxed),
             dyn_all: c.dyn_all.load(Relaxed),
             dyn_reopens: c.dyn_reopens.load(Relaxed),
+            refused: r.refused,
+            icmp_translated: r.icmp_translated,
+            rst_ignored: r.rst_ignored,
+            log_dropped: self.sh.log.dropped(),
         }
     }
 
@@ -907,6 +1073,7 @@ impl Engine {
         // After the handles are closed: dropping the responder joins its workers.
         self.dns = None;
         self.sh.log.line("engine stopped");
+        self.sh.log.flush(Duration::from_secs(2));
     }
 }
 
@@ -919,7 +1086,7 @@ impl Drop for Engine {
 /// One-line statistics summary for logs.
 pub fn stats_line(s: &EngineStats) -> String {
     format!(
-        "stats syns={} stalled={} alt_syns={} redialed={} orig_late={} losers_rst={} gave_up={} mapped={} xlat_in={} xlat_out={} dyn={}{} reopens={} desynced={} fakes={} dns_ans={} dns_pass={} captured={} send_err={}{}",
+        "stats syns={} stalled={} alt_syns={} redialed={} orig_late={} losers_rst={} gave_up={} refused={} mapped={} xlat_in={} xlat_out={} icmp_xlat={} rst_ignored={} dyn={}{} reopens={} desynced={} fakes={} dns_ans={} dns_pass={} captured={} send_err={} log_dropped={}{}",
         s.syns,
         s.stalled,
         s.alt_syns,
@@ -927,9 +1094,12 @@ pub fn stats_line(s: &EngineStats) -> String {
         s.orig_after_stall,
         s.losers_reset,
         s.gave_up,
+        s.refused,
         s.mapped,
         s.translated_in,
         s.translated_out,
+        s.icmp_translated,
+        s.rst_ignored,
         s.dyn_addrs,
         if s.dyn_all { "(all-tcp)" } else { "" },
         s.dyn_reopens,
@@ -939,6 +1109,7 @@ pub fn stats_line(s: &EngineStats) -> String {
         s.dns_passed,
         s.captured,
         s.send_errors,
+        s.log_dropped,
         if s.desync_panics > 0 { format!(" desync_panics={}", s.desync_panics) } else { String::new() },
     )
 }
@@ -946,8 +1117,13 @@ pub fn stats_line(s: &EngineStats) -> String {
 // ---- controller ------------------------------------------------------------------------------
 
 /// The on/off switch around an [`Engine`]; this is what the service hands to the control pipe.
+///
+/// `switch` serialises on/off changes (start and stop can take seconds: closing the DNS
+/// responder waits for a hanging DoH call); `engine` is only held for quick reads and swaps,
+/// so `status()` never waits for a start or stop in progress.
 pub struct Controller {
     cfg: Mutex<EngineConfig>,
+    switch: Mutex<()>,
     engine: Mutex<Option<Engine>>,
     enabled: AtomicBool,
     last_error: Mutex<Option<String>>,
@@ -955,7 +1131,13 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(cfg: EngineConfig) -> Controller {
-        Controller { cfg: Mutex::new(cfg), engine: Mutex::new(None), enabled: AtomicBool::new(false), last_error: Mutex::new(None) }
+        Controller {
+            cfg: Mutex::new(cfg),
+            switch: Mutex::new(()),
+            engine: Mutex::new(None),
+            enabled: AtomicBool::new(false),
+            last_error: Mutex::new(None),
+        }
     }
 
     /// Configuration used the next time the engine starts.
@@ -970,36 +1152,34 @@ impl Controller {
 
 impl EngineControl for Controller {
     fn set_enabled(&self, on: bool) -> Result<(), String> {
+        let _switch = lock(&self.switch);
         self.enabled.store(on, Relaxed);
-        let mut g = lock(&self.engine);
-        if on {
-            if g.as_ref().is_some_and(Engine::is_running) {
-                return Ok(());
+        if on && lock(&self.engine).as_ref().is_some_and(Engine::is_running) {
+            return Ok(());
+        }
+        // Take whatever runs (or died) out of the slot, then stop it without holding the slot.
+        let old = lock(&self.engine).take();
+        if let Some(e) = old {
+            if let Some(err) = e.error() {
+                *lock(&self.last_error) = Some(err);
             }
-            if let Some(dead) = g.take() {
-                dead.stop();
+            e.stop();
+        }
+        if !on {
+            return Ok(());
+        }
+        let cfg = lock(&self.cfg).clone();
+        match Engine::start(cfg) {
+            Ok(e) => {
+                *lock(&self.engine) = Some(e);
+                *lock(&self.last_error) = None;
+                Ok(())
             }
-            let cfg = lock(&self.cfg).clone();
-            match Engine::start(cfg) {
-                Ok(e) => {
-                    *g = Some(e);
-                    *lock(&self.last_error) = None;
-                    Ok(())
-                }
-                Err(e) => {
-                    let m = e.to_string();
-                    *lock(&self.last_error) = Some(m.clone());
-                    Err(m)
-                }
+            Err(e) => {
+                let m = e.to_string();
+                *lock(&self.last_error) = Some(m.clone());
+                Err(m)
             }
-        } else {
-            if let Some(e) = g.take() {
-                if let Some(err) = e.error() {
-                    *lock(&self.last_error) = Some(err);
-                }
-                e.stop();
-            }
-            Ok(())
         }
     }
 
@@ -1031,22 +1211,28 @@ mod tests {
     #[test]
     fn logic_filter_parts() {
         assert_eq!(logic_filter(false, "x", false, false), None);
+        // Desync alone still needs our SYN (client MSS) and the SYN-ACK (TTL, server MSS).
         assert_eq!(
             logic_filter(true, "false", false, false).unwrap(),
-            "!loopback and ((inbound and tcp.Syn and tcp.Ack))"
+            "!loopback and ((outbound and tcp.Syn and !tcp.Ack) or (inbound and tcp.Syn and tcp.Ack))"
         );
         let f = logic_filter(true, "tcp.PayloadLength > 0", true, true).unwrap();
         assert_eq!(
             f,
             "!loopback and ((outbound and tcp and (tcp.PayloadLength > 0)) or (outbound and tcp.Syn and !tcp.Ack) or \
-             (inbound and tcp.Syn and tcp.Ack) or (outbound and udp.DstPort == 53))"
+             (inbound and tcp.Syn and tcp.Ack) or (inbound and tcp.Rst and tcp.Ack and tcp.SeqNum == 0) or \
+             (outbound and udp.DstPort == 53))"
         );
         assert_eq!(logic_filter(false, "", false, true).unwrap(), "!loopback and ((outbound and udp.DstPort == 53))");
     }
 
     #[test]
     fn alt_and_dyn_filters() {
-        assert_eq!(alt_in_filter(25000, 29999), "inbound and !loopback and tcp and tcp.DstPort >= 25000 and tcp.DstPort <= 29999");
+        assert_eq!(
+            alt_in_filter(25000, 29999),
+            "inbound and !loopback and ((tcp and tcp.DstPort >= 25000 and tcp.DstPort <= 29999) or icmp.Type == 3 or \
+             (icmpv6.Type >= 1 and icmpv6.Type <= 3))"
+        );
         assert_eq!(dyn_out_filter(&[]), None);
         let a: Vec<IpAddr> = vec!["104.16.1.2".parse().unwrap(), "2606:4700::1".parse().unwrap()];
         assert_eq!(
@@ -1106,6 +1292,109 @@ mod tests {
                 n += 1;
             }
         }
+    }
+
+    #[test]
+    fn dns_fallback_gets_valid_checksums() {
+        let q = udp("192.168.1.5:55000".parse().unwrap(), "192.168.1.1:53".parse().unwrap(), b"\x12\x34query");
+        let mut b = q.into_bytes();
+        b[26] ^= 0x5a; // UDP checksum as checksum offload leaves it
+        b[10] = 0; // IPv4 header checksum left to the NIC
+        b[11] = 0;
+        let q = Packet::parse(b).unwrap();
+        assert!(!q.l4_checksum_ok());
+        let (p, outbound) = dns_outcome_packet(DnsOutcome::Fallback(q.clone()));
+        assert!(outbound);
+        assert!(p.l4_checksum_ok());
+        let mut fixed = p.clone();
+        fixed.fix_checksums();
+        assert_eq!(p.as_bytes(), fixed.as_bytes(), "IPv4 header checksum valid too");
+        assert_eq!(p.payload(), q.payload());
+        // Replies are already fixed by the responder and go inbound.
+        let r = q.udp_reply(b"answer").unwrap();
+        let (p, outbound) = dns_outcome_packet(DnsOutcome::Reply(r.clone()));
+        assert!(!outbound);
+        assert_eq!(p, r);
+    }
+
+    #[test]
+    fn chunk_size_is_bounded_by_both_mss_values() {
+        assert_eq!(max_payload(Some(1440), Some(1460)), Some(1440));
+        assert_eq!(max_payload(Some(1460), Some(1360)), Some(1360));
+        assert_eq!(max_payload(Some(1220), None), Some(1220));
+        assert_eq!(max_payload(None, Some(1400)), Some(1400));
+        assert_eq!(max_payload(None, None), None);
+        assert_eq!(max_payload(Some(0), Some(1400)), Some(1400), "nonsense values are ignored");
+        let h = Hint { ttl: Some(45), server_mss: Some(1460), client_mss: Some(1400), at: 0 };
+        assert_eq!(hint_to_flow(Some(h)), FlowHint { server_ttl: Some(45), max_payload: Some(1400) });
+        // The table merges the SYN's and the SYN-ACK's facts for one flow.
+        let mut t = Hints::default();
+        let (l, r): (SocketAddr, SocketAddr) = ("10.0.0.2:50000".parse().unwrap(), "1.1.1.1:443".parse().unwrap());
+        t.update(l, r, 1, |h| h.client_mss = Some(1380));
+        t.update(l, r, 2, |h| {
+            h.ttl = Some(50);
+            h.server_mss = Some(1460);
+        });
+        let f = hint_to_flow(t.map.get(&(l, r)).copied());
+        assert_eq!(f, FlowHint { server_ttl: Some(50), max_payload: Some(1380) });
+    }
+
+    /// A sink that blocks until released, like a console with a selection active.
+    struct Blocked(Arc<(Mutex<bool>, std::sync::Condvar)>, Arc<Mutex<Vec<u8>>>);
+    impl Write for Blocked {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            let (m, cv) = &*self.0;
+            let mut open = m.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+            self.1.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn logging_never_blocks_the_caller() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Logger::with_sink(Box::new(Blocked(gate.clone(), seen.clone())), 4).unwrap();
+        let t = Instant::now();
+        for i in 0..100 {
+            log.line(&format!("line {i}"));
+        }
+        assert!(t.elapsed() < Duration::from_millis(500), "line() must not wait for the sink");
+        assert!(log.dropped() >= 90, "dropped {}", log.dropped());
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(log.flush(Duration::from_secs(5)));
+        log.line("after");
+        assert!(log.flush(Duration::from_secs(5)));
+        let text = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("line 0"));
+        assert!(text.contains("log lines dropped"));
+        assert!(text.contains(" after\n"));
+        assert!(!Logger::none().enabled());
+        Logger::none().line("ignored");
+    }
+
+    #[test]
+    fn controller_reports_start_failure_without_blocking_status() {
+        // Without WinDivert next to the test binary or without elevation, start fails fast;
+        // status() must report the error and stay usable.
+        let c = Controller::new(EngineConfig { dns: false, ..EngineConfig::default() });
+        if c.set_enabled(true).is_ok() {
+            // Elevated environment with the driver: just switch it off again.
+            assert!(c.set_enabled(false).is_ok());
+            return;
+        }
+        let s = c.status();
+        assert!(s.enabled && !s.active);
+        assert!(s.error.is_some());
+        assert!(c.set_enabled(false).is_ok());
+        assert!(!c.status().enabled);
     }
 
     #[test]

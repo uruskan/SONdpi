@@ -7,7 +7,7 @@ Windows için tek anahtarla açılıp kapanan DPI atlatma aracı. GoodbyeDPI'nin
 - Motor bizim: GoodbyeDPI'den daha iyi olacak. GoodbyeDPI açık kaynaktır (Apache-2.0); fikirleri kullanılır, kod Rust'ta baştan yazılır.
 - Terminal programı değil. Bildirim alanında basit bir anahtar: tek tıkla aç, tek tıkla kapat.
 - En üst kararlılık ve hız her zaman tercih edilir. Süre gerekçesiyle kapsam küçültme önerme.
-- Repo adı SONdpi. README başlığı kullanıcının yazdığı cümledir; değiştirme.
+- Repo adı SONdpi. README başlığı yalnızca "SONdpi"dir (kullanıcı uzun, esprili başlığı 2026-11-13'te kaldırttı); "babayla yarışılmaz" rozeti ve maskot kalır. README'nin tonu esprili ama içeriği doğrudur: ölçülmemiş bir şey ölçülmüş gibi yazılmaz, gerçek kişilere söz uydurulmaz.
 - Repo public (2026-11-13). Commit'ler `uruskan` adı ve GitHub noreply adresiyle atılır; kullanıcının gerçek adı ve e-postası depoya, commit'lere ya da sürüm notlarına yazılmaz. Release çıkarmak ve dışarıdan dosya indirmek yalnızca kullanıcının onayıyla olur; ilk release, inceleme bulguları düzeltilip motor gerçek hatta sınandıktan sonra çıkar.
 
 ## Ölçülen gerçekler (Kasım 2026, Turkcell 5G ev interneti, CGNAT, IPv4 + IPv6)

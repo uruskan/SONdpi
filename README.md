@@ -1,10 +1,10 @@
-# BABAYLA ZOR YARIŞIRLAR, BIKTIM AQ ÇALIŞMAYAN GOODBYEPIDEN ILLA KENDIMIZ MI YAPALIM KARDEŞİM
+# SONdpi
 
 <p align="center">
   <img src="assets/sondpi-chan.svg" width="280" alt="SONdpi maskotu: saçında açık konumda bir anahtar tokası olan mor saçlı karakter">
 </p>
 
-<h3 align="center">SONdpi — Windows için tek anahtarlı DPI atlatma aracı</h3>
+<h3 align="center">Windows için tek anahtarlı DPI atlatma aracı</h3>
 
 <p align="center">
   Discord, Roblox ve benzeri sitelere erişimi engelleyen derin paket incelemesini (DPI) atlatır.<br>

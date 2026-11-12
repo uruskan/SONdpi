@@ -28,6 +28,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
+    QueryServiceConfigW, QUERY_SERVICE_CONFIGW, SERVICE_CHANGE_CONFIG, SERVICE_DEMAND_START,
+    SERVICE_QUERY_CONFIG,
     CreateServiceW, SC_HANDLE, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
     StartServiceW, SC_ACTION, SC_ACTION_RESTART, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT,
     SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
@@ -415,10 +417,210 @@ fn open_scm(access: u32) -> Result<ScHandle, String> {
 }
 
 fn open_service(scm: &ScHandle, access: u32) -> Option<ScHandle> {
-    let name = wide(api::SERVICE_NAME);
+    open_service_named(scm, api::SERVICE_NAME, access).ok()
+}
+
+/// Open a service by name; `Err` carries the Win32 error code.
+fn open_service_named(scm: &ScHandle, name: &str, access: u32) -> Result<ScHandle, u32> {
+    let name = wide(name);
     // SAFETY: valid handle and name.
     let h = unsafe { OpenServiceW(scm.0, name.as_ptr(), access) };
-    if h.is_null() { None } else { Some(ScHandle(h)) }
+    if h.is_null() {
+        // SAFETY: trivial.
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(ScHandle(h))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hand-over from GoodbyeDPI
+// ---------------------------------------------------------------------------------------------
+//
+// Two DPI tools must not run together. On install the `GoodbyeDPI` service (if any) is stopped
+// and set to demand start; its original start type and running state are remembered under HKLM
+// and put back on uninstall. That service is never deleted or changed in any other way.
+
+pub const GOODBYEDPI_SERVICE: &str = "GoodbyeDPI";
+const GDPI_START_VALUE: &str = "GoodbyeDpiStart";
+const GDPI_RUNNING_VALUE: &str = "GoodbyeDpiWasRunning";
+const START_AUTO: u32 = 2;
+
+/// The state of the GoodbyeDPI service as it was before SONdpi touched it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdpiSaved {
+    pub start: u32,
+    pub was_running: bool,
+}
+
+/// Inputs of the install decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdpiProbe {
+    pub present: bool,
+    pub start_type: u32,
+    /// Running or on its way up/down (anything but stopped).
+    pub running: bool,
+    /// Values already stored by an earlier install.
+    pub stored: Option<GdpiSaved>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdpiInstallPlan {
+    /// Remember these (only when nothing is stored yet).
+    pub store: Option<GdpiSaved>,
+    pub stop: bool,
+    /// Switch an automatic service to demand start. Manual and disabled ones stay as they are:
+    /// neither comes back at boot.
+    pub set_demand: bool,
+}
+
+pub fn plan_install_handover(p: &GdpiProbe) -> GdpiInstallPlan {
+    if !p.present {
+        return GdpiInstallPlan { store: None, stop: false, set_demand: false };
+    }
+    GdpiInstallPlan {
+        store: if p.stored.is_none() { Some(GdpiSaved { start: p.start_type, was_running: p.running }) } else { None },
+        stop: p.running,
+        set_demand: p.start_type == START_AUTO,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdpiRestorePlan {
+    pub set_start: Option<u32>,
+    pub start: bool,
+}
+
+pub fn plan_restore(present: bool, stored: Option<GdpiSaved>) -> GdpiRestorePlan {
+    match (present, stored) {
+        (true, Some(s)) => GdpiRestorePlan { set_start: Some(s.start), start: s.was_running },
+        _ => GdpiRestorePlan { set_start: None, start: false },
+    }
+}
+
+fn read_gdpi_saved() -> Option<GdpiSaved> {
+    let start = reg_get_dword(HKEY_LOCAL_MACHINE, api::REG_KEY, GDPI_START_VALUE)?;
+    let running = reg_get_dword(HKEY_LOCAL_MACHINE, api::REG_KEY, GDPI_RUNNING_VALUE)?;
+    Some(GdpiSaved { start, was_running: running != 0 })
+}
+
+fn write_gdpi_saved(s: GdpiSaved) -> Result<(), String> {
+    reg_set_dword(HKEY_LOCAL_MACHINE, api::REG_KEY, GDPI_START_VALUE, s.start)?;
+    reg_set_dword(HKEY_LOCAL_MACHINE, api::REG_KEY, GDPI_RUNNING_VALUE, s.was_running as u32)
+}
+
+fn query_start_type(svc: &ScHandle) -> Option<u32> {
+    let mut buf = vec![0u64; 1024];
+    let mut need = 0u32;
+    for _ in 0..2 {
+        // SAFETY: buffer of buf.len()*8 bytes, 8-aligned, as QUERY_SERVICE_CONFIGW requires.
+        let ok = unsafe { QueryServiceConfigW(svc.0, buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW, (buf.len() * 8) as u32, &mut need) };
+        if ok != 0 {
+            // SAFETY: the call filled a QUERY_SERVICE_CONFIGW at the start of the buffer.
+            return Some(unsafe { (*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW)).dwStartType });
+        }
+        // SAFETY: trivial.
+        if unsafe { GetLastError() } != 122 {
+            return None;
+        }
+        buf = vec![0u64; (need as usize).div_ceil(8) + 1];
+    }
+    None
+}
+
+fn set_start_type(svc: &ScHandle, start: u32) -> Result<(), String> {
+    // SAFETY: only the start type is changed; everything else is NO_CHANGE / null.
+    let ok = unsafe {
+        ChangeServiceConfigW(svc.0, SERVICE_NO_CHANGE, start, SERVICE_NO_CHANGE, null(), null(), null_mut(), null(), null(), null(), null())
+    };
+    if ok == 0 {
+        // SAFETY: trivial.
+        Err(format!("başlangıç türü değiştirilemedi (hata {})", unsafe { GetLastError() }))
+    } else {
+        Ok(())
+    }
+}
+
+const GDPI_ACCESS: u32 = SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP;
+
+/// Install side. Returns the sentence to append to the final message ("" when there was nothing
+/// to hand over).
+fn handover_install(scm: &ScHandle) -> String {
+    let svc = match open_service_named(scm, GOODBYEDPI_SERVICE, GDPI_ACCESS) {
+        Ok(s) => s,
+        Err(e) if e == ERROR_SERVICE_DOES_NOT_EXIST => return String::new(),
+        Err(e) => return gdpi_install_failed(&format!("hizmete erişilemedi, hata {e}")),
+    };
+    let (Some(start_type), Some((state, _))) = (query_start_type(&svc), query_state(&svc)) else {
+        return gdpi_install_failed("durumu okunamadı");
+    };
+    let stored = read_gdpi_saved();
+    let probe = GdpiProbe { present: true, start_type, running: state != SERVICE_STOPPED, stored };
+    let plan = plan_install_handover(&probe);
+    if let Some(s) = plan.store {
+        if let Err(e) = write_gdpi_saved(s) {
+            // Without a record we must not change anything.
+            return gdpi_install_failed(&format!("özgün ayar kaydedilemedi ({e}), hizmete dokunulmadı"));
+        }
+    }
+    let mut errs: Vec<String> = Vec::new();
+    if plan.stop {
+        if let Err(e) = stop_service(&svc, Duration::from_secs(15)) {
+            errs.push(e);
+        }
+    }
+    if plan.set_demand {
+        if let Err(e) = set_start_type(&svc, SERVICE_DEMAND_START) {
+            errs.push(e);
+        }
+    }
+    if !errs.is_empty() {
+        return gdpi_install_failed(&errs.join("; "));
+    }
+    if plan.stop || plan.set_demand || stored.is_some() {
+        " GoodbyeDPI hizmeti durduruldu; SONdpi kaldırılırsa eski haline döndürülecek.".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn gdpi_install_failed(detail: &str) -> String {
+    format!(" Dikkat: GoodbyeDPI hizmeti durdurulamadı ({detail}). İki araç aynı anda çalışmamalı; GoodbyeDPI'yi elle durdurun.")
+}
+
+/// Uninstall side. Returns the sentence to append ("" when nothing was stored or the service is gone).
+fn handover_restore(scm: &ScHandle) -> String {
+    let stored = read_gdpi_saved();
+    if stored.is_none() {
+        return String::new();
+    }
+    let svc = match open_service_named(scm, GOODBYEDPI_SERVICE, GDPI_ACCESS) {
+        Ok(s) => Some(s),
+        Err(e) if e == ERROR_SERVICE_DOES_NOT_EXIST => None,
+        Err(e) => return gdpi_restore_failed(&format!("hizmete erişilemedi, hata {e}")),
+    };
+    let plan = plan_restore(svc.is_some(), stored);
+    let Some(svc) = svc else { return String::new() };
+    let mut errs: Vec<String> = Vec::new();
+    if let Some(st) = plan.set_start {
+        if let Err(e) = set_start_type(&svc, st) {
+            errs.push(e);
+        }
+    }
+    if plan.start {
+        if let Err(e) = start_service(&svc, Duration::from_secs(15)) {
+            errs.push(e);
+        }
+    }
+    if errs.is_empty() {
+        " GoodbyeDPI hizmeti eski haline döndürüldü.".to_string()
+    } else {
+        gdpi_restore_failed(&errs.join("; "))
+    }
+}
+
+fn gdpi_restore_failed(detail: &str) -> String {
+    format!(" GoodbyeDPI hizmeti eski haline döndürülemedi ({detail}); gerekirse elle ayarlayın.")
 }
 
 /// Is the SONdpi service registered with the SCM? Works unelevated.
@@ -747,6 +949,9 @@ fn do_install(opts: &Opts) -> Result<String, String> {
         }
     }
 
+    // Hand over from GoodbyeDPI before our engine starts (never fatal).
+    let gdpi_note = handover_install(&scm);
+
     create_or_update_service(&scm, &dst_exe).map_err(|e| format!("Kurulamadı: {e}"))?;
     let svc = open_service(&scm, SERVICE_QUERY_STATUS | SERVICE_START).ok_or("Kurulamadı: servis açılamadı")?;
     start_service(&svc, Duration::from_secs(30)).map_err(|e| format!("Servis kuruldu ama başlamadı: {e}"))?;
@@ -760,7 +965,7 @@ fn do_install(opts: &Opts) -> Result<String, String> {
     if !opts.no_tray {
         launch_tray_unelevated(&dst_exe);
     }
-    Ok(format!("SONdpi kuruldu ve çalışıyor. Bildirim alanındaki anahtardan açıp kapatabilirsiniz.{note}"))
+    Ok(format!("SONdpi kuruldu ve çalışıyor. Bildirim alanındaki anahtardan açıp kapatabilirsiniz.{note}{gdpi_note}"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -874,6 +1079,7 @@ fn do_uninstall(opts: &Opts) -> Result<String, String> {
         return Err("Kurulum klasörü doğrulanamadı; hiçbir şey silinmedi.".into());
     }
     let mut problems: Vec<String> = Vec::new();
+    let mut gdpi_note = String::new();
 
     if let Ok(scm) = open_scm(SC_MANAGER_ALL_ACCESS) {
         if let Some(svc) = open_service(&scm, SERVICE_QUERY_STATUS | SERVICE_STOP | 0x0001_0000 /* DELETE */) {
@@ -890,6 +1096,8 @@ fn do_uninstall(opts: &Opts) -> Result<String, String> {
                 }
             }
         }
+        // SONdpi is stopped and gone: give GoodbyeDPI back (before the registry record is removed).
+        gdpi_note = handover_restore(&scm);
     }
 
     kill_processes_in(&dir);
@@ -935,12 +1143,13 @@ fn do_uninstall(opts: &Opts) -> Result<String, String> {
     }
 
     if !problems.is_empty() {
-        return Err(format!("Kaldırma tamamlanamadı: {}", problems.join("; ")));
+        return Err(format!("Kaldırma tamamlanamadı: {}.{gdpi_note}", problems.join("; ")));
     }
     let mut msg = String::from("SONdpi kaldırıldı.");
     if at_reboot {
         msg.push_str(" Bazı dosyalar bilgisayar yeniden başlatılınca silinecek.");
     }
+    msg.push_str(&gdpi_note);
     Ok(msg)
 }
 
@@ -966,6 +1175,68 @@ mod tests {
         let l = delayed_cleanup_line(exe, exe.parent().unwrap());
         assert!(l.contains("del /f /q \"C:\\Program Files\\SONdpi\\sondpi.exe\""));
         assert!(l.ends_with("rmdir \"C:\\Program Files\\SONdpi\""));
+    }
+
+    fn probe(present: bool, start: u32, running: bool, stored: Option<GdpiSaved>) -> GdpiProbe {
+        GdpiProbe { present, start_type: start, running, stored }
+    }
+
+    #[test]
+    fn handover_absent_changes_nothing() {
+        let p = plan_install_handover(&probe(false, 2, true, None));
+        assert_eq!(p, GdpiInstallPlan { store: None, stop: false, set_demand: false });
+        // Even a stale record does not make us act on a missing service.
+        let p = plan_install_handover(&probe(false, 0, false, Some(GdpiSaved { start: 2, was_running: true })));
+        assert_eq!(p, GdpiInstallPlan { store: None, stop: false, set_demand: false });
+    }
+
+    #[test]
+    fn handover_auto_running_first_install() {
+        let p = plan_install_handover(&probe(true, 2, true, None));
+        assert_eq!(p, GdpiInstallPlan { store: Some(GdpiSaved { start: 2, was_running: true }), stop: true, set_demand: true });
+    }
+
+    #[test]
+    fn handover_auto_but_stopped() {
+        let p = plan_install_handover(&probe(true, 2, false, None));
+        assert_eq!(p, GdpiInstallPlan { store: Some(GdpiSaved { start: 2, was_running: false }), stop: false, set_demand: true });
+    }
+
+    #[test]
+    fn handover_disabled_and_manual_keep_their_start_type() {
+        let p = plan_install_handover(&probe(true, 4, false, None));
+        assert_eq!(p, GdpiInstallPlan { store: Some(GdpiSaved { start: 4, was_running: false }), stop: false, set_demand: false });
+        let p = plan_install_handover(&probe(true, 3, true, None));
+        assert_eq!(p, GdpiInstallPlan { store: Some(GdpiSaved { start: 3, was_running: true }), stop: true, set_demand: false });
+    }
+
+    #[test]
+    fn handover_upgrade_never_overwrites_the_original() {
+        let orig = GdpiSaved { start: 2, was_running: true };
+        // We left it manual and stopped last time: the record must stay as it was.
+        let p = plan_install_handover(&probe(true, 3, false, Some(orig)));
+        assert_eq!(p, GdpiInstallPlan { store: None, stop: false, set_demand: false });
+        // The user started it again meanwhile: stop it again, still keep the record.
+        let p = plan_install_handover(&probe(true, 3, true, Some(orig)));
+        assert_eq!(p, GdpiInstallPlan { store: None, stop: true, set_demand: false });
+        // Someone put it back to automatic.
+        let p = plan_install_handover(&probe(true, 2, true, Some(orig)));
+        assert_eq!(p, GdpiInstallPlan { store: None, stop: true, set_demand: true });
+    }
+
+    #[test]
+    fn restore_branches() {
+        let s = GdpiSaved { start: 2, was_running: true };
+        assert_eq!(plan_restore(true, Some(s)), GdpiRestorePlan { set_start: Some(2), start: true });
+        let s = GdpiSaved { start: 2, was_running: false };
+        assert_eq!(plan_restore(true, Some(s)), GdpiRestorePlan { set_start: Some(2), start: false });
+        let s = GdpiSaved { start: 4, was_running: false };
+        assert_eq!(plan_restore(true, Some(s)), GdpiRestorePlan { set_start: Some(4), start: false });
+        // Service removed meanwhile, or nothing stored: do nothing.
+        let s = GdpiSaved { start: 2, was_running: true };
+        assert_eq!(plan_restore(false, Some(s)), GdpiRestorePlan { set_start: None, start: false });
+        assert_eq!(plan_restore(true, None), GdpiRestorePlan { set_start: None, start: false });
+        assert_eq!(plan_restore(false, None), GdpiRestorePlan { set_start: None, start: false });
     }
 
     #[test]

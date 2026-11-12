@@ -3,6 +3,10 @@
 //!   sondpi service         engine, started by the Service Control Manager
 //!   sondpi dev [...]       console/dev mode for measurements (needs administrator)
 //!   sondpi install|uninstall
+//!
+//! Built for the GUI subsystem so the tray opens no console window. The console roles do not
+//! rely on stdout: `dev` writes its log file, `ctl` attaches to the parent console itself.
+#![windows_subsystem = "windows"]
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

@@ -1,4 +1,4 @@
-﻿//! Self-install / uninstall, plus the small Win32 helpers (registry, elevation, service control
+//! Self-install / uninstall, plus the small Win32 helpers (registry, elevation, service control
 //! manager) that the other shell modules share.
 //!
 //! Install touches only: the folder `%ProgramFiles%\SONdpi`, the `SONdpi` service, the
@@ -13,7 +13,7 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST,
+    CloseHandle, HWND, GetLastError, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST,
     ERROR_SERVICE_NOT_ACTIVE, FALSE, HANDLE, TRUE,
 };
 use windows_sys::Win32::Security::{
@@ -54,9 +54,13 @@ use windows_sys::Win32::UI::Shell::{
     SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IsWindowVisible, MessageBoxW, MB_ICONERROR, MB_OK, SW_HIDE, SW_SHOWNORMAL,
+    FindWindowExW, GetWindowThreadProcessId, IsWindowVisible, MessageBoxW, PostMessageW, WM_CLOSE, MB_ICONERROR, MB_OK, SW_HIDE, SW_SHOWNORMAL,
 };
 
+/// Window class of the tray's hidden window (the installer finds running trays by it).
+pub const TRAY_WINDOW_CLASS: &str = "SONdpiTrayWindow";
+/// Per-user settings key (HKCU), e.g. the mascot switch.
+pub const USER_KEY: &str = r"Software\SONdpi";
 /// File name of the installed executable.
 pub const EXE_NAME: &str = "sondpi.exe";
 /// Per-user autostart key and value name.
@@ -757,6 +761,17 @@ fn is_leftover(name: &str) -> bool {
     }
 }
 
+/// Best effort: delete *.old leftovers of an earlier upgrade from the install folder (an
+/// unelevated caller usually lacks the right; the installer does it elevated).
+pub fn cleanup_installed_leftovers() {
+    cleanup_leftovers(&install_dir());
+}
+
+/// Remove the current user's SONdpi settings (HKCU).
+pub fn remove_user_settings() {
+    let _ = reg_delete_tree(HKEY_CURRENT_USER, USER_KEY);
+}
+
 fn cleanup_leftovers(dir: &Path) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -866,9 +881,14 @@ fn relaunch_elevated(role: &str, args: &[String], opts: &Opts) -> i32 {
     let _ = args;
     child.push("--result".into());
     child.push(result.to_string_lossy().into_owned());
+    // An upgrade must replace the running tray: close it first, bring one back if we fail.
+    let closed_trays = role == "install" && !opts.no_tray && close_running_trays();
     let code = match shell_run(&exe, &join_args(&child), true, true, true) {
         Ok(c) => c,
         Err(e) => {
+            if closed_trays {
+                launch_tray_unelevated(&installed_exe());
+            }
             let msg = format!("Yönetici onayı alınamadı: {e}");
             return finish(&Opts::default(), Err(msg));
         }
@@ -876,6 +896,9 @@ fn relaunch_elevated(role: &str, args: &[String], opts: &Opts) -> i32 {
     let msg = std::fs::read_to_string(&result).unwrap_or_default();
     let _ = std::fs::remove_file(&result);
     if code != 0 {
+        if closed_trays {
+            launch_tray_unelevated(&installed_exe());
+        }
         let m = if msg.is_empty() { format!("İşlem başarısız oldu (kod {code}).") } else { msg };
         return finish(&Opts::default(), Err(m));
     }
@@ -887,7 +910,73 @@ fn relaunch_elevated(role: &str, args: &[String], opts: &Opts) -> i32 {
             launch_tray_unelevated(&installed_exe());
         }
     }
+    if role == "uninstall" {
+        if !opts.no_autostart {
+            let _ = autostart_set(false);
+            remove_user_settings();
+        }
+    }
     finish(&Opts::default(), Ok(msg))
+}
+
+/// Should the tray window owned by process pid (running image) be asked to exit because the
+/// installed program is being replaced? Yes for any tray running from the install folder except
+/// ourselves; trays of other copies (a downloaded or development build) are left alone.
+pub fn should_close_tray(image: &Path, install_dir: &Path, pid: u32, self_pid: u32) -> bool {
+    if pid == self_pid {
+        return false;
+    }
+    let img = image.to_string_lossy().to_lowercase();
+    let dir = install_dir.to_string_lossy().to_lowercase();
+    let dir = dir.trim_end_matches('\\');
+    img.len() > dir.len() && img.starts_with(dir) && img[dir.len()..].starts_with('\\')
+}
+
+fn trays_to_close(dir: &Path) -> Vec<(usize, u32)> {
+    let class = wide(TRAY_WINDOW_CLASS);
+    // SAFETY: trivial.
+    let me = unsafe { GetCurrentProcessId() };
+    let mut out = Vec::new();
+    let mut prev: HWND = null_mut();
+    loop {
+        // SAFETY: enumerates top-level windows of our class; handles are only compared/posted to.
+        let h = unsafe { FindWindowExW(null_mut(), prev, class.as_ptr(), null()) };
+        if h.is_null() {
+            break;
+        }
+        prev = h;
+        let mut pid = 0u32;
+        // SAFETY: valid window handle and out pointer.
+        unsafe { GetWindowThreadProcessId(h, &mut pid) };
+        if let Some((img, hp)) = image_path_of(pid) {
+            // SAFETY: handle opened by image_path_of.
+            unsafe { CloseHandle(hp) };
+            if should_close_tray(&img, dir, pid, me) {
+                out.push((h as usize, pid));
+            }
+        }
+    }
+    out
+}
+
+/// Ask running trays of the installed program to exit and wait up to 3 s for them. Returns
+/// whether any was asked (so the caller can start one again if the install does not go ahead).
+pub fn close_running_trays() -> bool {
+    let dir = install_dir();
+    let list = trays_to_close(&dir);
+    if list.is_empty() {
+        return false;
+    }
+    for (h, _) in &list {
+        // SAFETY: WM_CLOSE to a tray window; allowed across integrity levels from a higher one,
+        // and between same-level processes.
+        unsafe { PostMessageW(*h as HWND, WM_CLOSE, 0, 0) };
+    }
+    let end = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < end && !trays_to_close(&dir).is_empty() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
 }
 
 /// Start the tray in the logged-in user's normal (unelevated) context via the shell.
@@ -909,7 +998,13 @@ pub fn install(args: &[String]) -> i32 {
     if !is_elevated() {
         return relaunch_elevated("install", args, &opts);
     }
+    // Replace the running tray on upgrade (the unelevated parent path does this itself and
+    // passes --no-tray to us).
+    let closed_trays = !opts.no_tray && close_running_trays();
     let r = do_install(&opts);
+    if r.is_err() && closed_trays {
+        launch_tray_unelevated(&installed_exe());
+    }
     finish(&opts, r)
 }
 
@@ -1103,6 +1198,7 @@ fn do_uninstall(opts: &Opts) -> Result<String, String> {
     kill_processes_in(&dir);
     if !opts.no_autostart {
         let _ = autostart_set(false);
+        remove_user_settings();
     }
     if let Err(e) = reg_delete_tree(HKEY_LOCAL_MACHINE, api::REG_KEY) {
         problems.push(e);
@@ -1237,6 +1333,22 @@ mod tests {
         assert_eq!(plan_restore(false, Some(s)), GdpiRestorePlan { set_start: None, start: false });
         assert_eq!(plan_restore(true, None), GdpiRestorePlan { set_start: None, start: false });
         assert_eq!(plan_restore(false, None), GdpiRestorePlan { set_start: None, start: false });
+    }
+
+    #[test]
+    fn tray_replacement_decision() {
+        let dir = Path::new(r"C:\Program Files\SONdpi");
+        let img = |s: &str| PathBuf::from(s);
+        assert!(should_close_tray(&img(r"C:\Program Files\SONdpi\sondpi.exe"), dir, 10, 99));
+        // The renamed old binary of an upgrade is still the installed program.
+        assert!(should_close_tray(&img(r"C:\Program Files\SONdpi\sondpi.exe.old"), dir, 10, 99));
+        // Case and a trailing backslash do not matter.
+        assert!(should_close_tray(&img(r"c:\program files\sondpi\SONDPI.EXE"), Path::new(r"C:\Program Files\SONdpi\"), 10, 99));
+        // Ourselves, other copies and look-alike folders are left alone.
+        assert!(!should_close_tray(&img(r"C:\Program Files\SONdpi\sondpi.exe"), dir, 99, 99));
+        assert!(!should_close_tray(&img(r"C:\Users\u\Downloads\sondpi.exe"), dir, 10, 99));
+        assert!(!should_close_tray(&img(r"C:\Program Files\SONdpi2\sondpi.exe"), dir, 10, 99));
+        assert!(!should_close_tray(&img(r"C:\Program Files\SONdpi"), dir, 10, 99));
     }
 
     #[test]

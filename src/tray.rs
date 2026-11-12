@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Console::{
     AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER;
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{
@@ -39,7 +40,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CheckMenuItem, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
-    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
+    DefWindowProcW, DestroyIcon, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
     GetCursorPos, GetMessageW, GetWindowTextW, KillTimer, MessageBoxW,
     ModifyMenuW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
     SetForegroundWindow, SetTimer, SetWindowTextW, TrackPopupMenu, TranslateMessage, HICON,
@@ -60,7 +61,20 @@ const POLL_MS: u32 = 2000;
 const POLL_TIMEOUT_MS: u32 = 1500;
 const TOGGLE_TIMEOUT_MS: u32 = 20_000;
 const CLICK_DEBOUNCE_MS: u64 = 400;
-const CLASS_NAME: &str = "SONdpiTrayWindow";
+/// Window class; a development pipe (`SONDPI_PIPE`) gets its own, so a test tray never meets the
+/// real one.
+fn class_name() -> String {
+    format!("{}{}", install::TRAY_WINDOW_CLASS, dev_suffix())
+}
+
+fn dev_suffix() -> String {
+    let n = ipc::default_pipe_name();
+    if n == api::PIPE_NAME {
+        String::new()
+    } else {
+        format!("-{}", n.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
+    }
+}
 
 const ID_TOGGLE: usize = 1;
 const ID_INFO_BASE: usize = 2; // 2, 3, 4
@@ -68,6 +82,7 @@ const ID_ERROR: usize = 5;
 const ID_AUTOSTART: usize = 6;
 const ID_UNINSTALL: usize = 7;
 const ID_EXIT: usize = 8;
+const ID_MASCOT: usize = 9;
 
 // ---------------------------------------------------------------------------------------------
 // What the user sees (pure logic)
@@ -171,6 +186,61 @@ pub fn menu_model(v: &View) -> MenuModel {
         ],
         error: error.map(|e| truncate_utf16(&e, 120)),
     }
+}
+
+/// Per-user setting (HKCU `Software\SONdpi`, DWORD `Mascot`): use the mascot icons. Default on.
+pub const MASCOT_VALUE: &str = "Mascot";
+
+pub fn parse_mascot(v: Option<u32>) -> bool {
+    v.map(|x| x != 0).unwrap_or(true)
+}
+
+fn mascot_enabled() -> bool {
+    parse_mascot(install::reg_get_dword(HKEY_CURRENT_USER, install::USER_KEY, MASCOT_VALUE))
+}
+
+fn set_mascot(on: bool) -> Result<(), String> {
+    install::reg_set_dword(HKEY_CURRENT_USER, install::USER_KEY, MASCOT_VALUE, on as u32)
+}
+
+/// Icon resource linked into the executable (see assets/sondpi.rc): 1 on, 2 off, 3 problem.
+pub fn resource_id(s: IconState) -> u16 {
+    match s {
+        IconState::On => 1,
+        IconState::Off => 2,
+        IconState::Problem => 3,
+    }
+}
+
+/// One line of the right-click menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuEntry {
+    pub id: usize,
+    pub text: String,
+    pub grayed: bool,
+    pub checked: Option<bool>,
+    pub separator: bool,
+}
+
+/// The whole menu, in order.
+pub fn menu_entries(v: &View, autostart: bool, mascot: bool) -> Vec<MenuEntry> {
+    let m = menu_model(v);
+    let item = |id: usize, text: &str, grayed: bool, checked: Option<bool>| MenuEntry { id, text: text.to_string(), grayed, checked, separator: false };
+    let sep = || MenuEntry { id: 0, text: String::new(), grayed: false, checked: None, separator: true };
+    let mut out = vec![item(ID_TOGGLE, "Açık", false, Some(m.checked))];
+    for (i, l) in m.lines.iter().enumerate() {
+        out.push(item(ID_INFO_BASE + i, l, true, None));
+    }
+    if let Some(e) = &m.error {
+        out.push(item(ID_ERROR, e, true, None));
+    }
+    out.push(sep());
+    out.push(item(ID_AUTOSTART, "Windows açılışında başlat", false, Some(autostart)));
+    out.push(item(ID_MASCOT, "Maskot simgesi", false, Some(mascot)));
+    out.push(item(ID_UNINSTALL, "SONdpi'yi kaldır…", false, None));
+    out.push(sep());
+    out.push(item(ID_EXIT, "Çıkış", false, None));
+    out
 }
 
 /// Merge an error the last toggle produced into what the service reported.
@@ -308,6 +378,16 @@ fn make_hicon(s: IconState, size: usize) -> HICON {
     }
 }
 
+/// The mascot icon from the executable's resources at size, or null (library and test builds
+/// carry no resources).
+fn load_resource_icon(s: IconState, size: usize) -> HICON {
+    // SAFETY: MAKEINTRESOURCE(id) as the name; the icon is ours and destroyed with DestroyIcon.
+    unsafe {
+        let hinst = GetModuleHandleW(null());
+        LoadImageW(hinst, resource_id(s) as usize as *const u16, IMAGE_ICON, size as i32, size as i32, LR_DEFAULTCOLOR) as HICON
+    }
+}
+
 /// Small-icon size for the monitor the taskbar is on.
 fn tray_icon_size() -> usize {
     let class = wide("Shell_TrayWnd");
@@ -347,6 +427,9 @@ struct Tray {
     sticky_ttl: u8,
     icons: [HICON; 3],
     icon_size: usize,
+    /// The setting the current icons were built for.
+    icons_mascot: bool,
+    mascot: bool,
     shown: Option<(IconState, String)>,
     added: bool,
     polling: bool,
@@ -380,7 +463,7 @@ fn icon_index(s: IconState) -> usize {
 
 fn rebuild_icons(t: &mut Tray) {
     let size = tray_icon_size();
-    if size == t.icon_size && t.icons.iter().all(|i| !i.is_null()) {
+    if size == t.icon_size && t.icons_mascot == t.mascot && t.icons.iter().all(|i| !i.is_null()) {
         return;
     }
     for i in t.icons.iter_mut() {
@@ -390,7 +473,12 @@ fn rebuild_icons(t: &mut Tray) {
         }
     }
     t.icon_size = size;
-    t.icons = [IconState::On, IconState::Off, IconState::Problem].map(|s| make_hicon(s, size));
+    t.icons_mascot = t.mascot;
+    let mascot = t.mascot;
+    t.icons = [IconState::On, IconState::Off, IconState::Problem].map(|s| {
+        let m = if mascot { load_resource_icon(s, size) } else { null_mut() };
+        if m.is_null() { make_hicon(s, size) } else { m }
+    });
     t.shown = None; // force the next update to push the new icon
 }
 
@@ -676,27 +764,21 @@ fn show_menu(hwnd: HWND, at: POINT) {
     let Some(ev) = with(|t| effective(&t.view, &t.sticky_error)) else { return };
     // Refresh while the menu is open: the answer updates the items in place.
     poll(hwnd);
-    let model = menu_model(&ev);
     let auto = install::autostart_enabled();
+    let mascot = with(|t| t.mascot).unwrap_or(true);
     // SAFETY: creates a popup menu we destroy below.
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
         return;
     }
-    append(menu, item_flags(false, Some(model.checked)), ID_TOGGLE, "Açık");
-    for (i, l) in model.lines.iter().enumerate() {
-        append(menu, item_flags(true, None), ID_INFO_BASE + i, l);
+    for e in menu_entries(&ev, auto, mascot) {
+        if e.separator {
+            // SAFETY: valid menu.
+            unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) };
+        } else {
+            append(menu, item_flags(e.grayed, e.checked), e.id, &e.text);
+        }
     }
-    if let Some(e) = &model.error {
-        append(menu, item_flags(true, None), ID_ERROR, e);
-    }
-    // SAFETY: valid menu.
-    unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) };
-    append(menu, item_flags(false, Some(auto)), ID_AUTOSTART, "Windows açılışında başlat");
-    append(menu, item_flags(false, None), ID_UNINSTALL, "SONdpi'yi kaldır…");
-    // SAFETY: valid menu.
-    unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) };
-    append(menu, item_flags(false, None), ID_EXIT, "Çıkış");
     with(|t| t.menu = menu);
 
     // SAFETY: standard tray-menu sequence; the menu loop pumps messages, so no state borrow is held.
@@ -717,6 +799,16 @@ fn show_menu(hwnd: HWND, at: POINT) {
                 balloon(hwnd, &format!("Başlangıç ayarı değiştirilemedi: {e}"));
             }
         }
+        ID_MASCOT => match set_mascot(!mascot) {
+            Ok(()) => {
+                with(|t| {
+                    t.mascot = !mascot;
+                    rebuild_icons(t);
+                });
+                refresh_ui(hwnd);
+            }
+            Err(e) => balloon(hwnd, &format!("Ayar değiştirilemedi: {e}")),
+        },
         ID_UNINSTALL => uninstall_from_menu(hwnd),
         ID_EXIT => {
             // SAFETY: closes our own window.
@@ -737,6 +829,7 @@ fn uninstall_from_menu(hwnd: HWND) {
     match install::shell_run(&exe, "uninstall", true, false, true) {
         Ok(_) => {
             let _ = install::autostart_set(false);
+            install::remove_user_settings();
             // SAFETY: closes our own window; the elevated uninstaller carries on without us.
             unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
         }
@@ -878,7 +971,7 @@ fn attach_console() {
 }
 
 fn find_tray_window() -> HWND {
-    let class = wide(CLASS_NAME);
+    let class = wide(&class_name());
     // SAFETY: valid class name.
     unsafe { FindWindowW(class.as_ptr(), null()) }
 }
@@ -946,11 +1039,13 @@ pub fn run(args: &[String]) -> i32 {
         return run_ctl(&args[1..]);
     }
     let no_setup = args.iter().any(|a| a == "--no-setup");
+    // A leftover of an earlier upgrade (best effort; needs write access to the install folder).
+    install::cleanup_installed_leftovers();
 
     // SAFETY: process-wide setting, must precede window creation; failure just leaves defaults.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
-    let mname = wide("Local\\SONdpi.Tray.Instance");
+    let mname = wide(&format!("Local\\SONdpi.Tray.Instance{}", dev_suffix()));
     // SAFETY: valid name; the handle lives until the process exits.
     let mutex = unsafe { CreateMutexW(null(), 0, mname.as_ptr()) };
     // SAFETY: trivial.
@@ -960,7 +1055,7 @@ pub fn run(args: &[String]) -> i32 {
 
     // SAFETY: null module name = this executable.
     let hinst = unsafe { GetModuleHandleW(null()) };
-    let class = wide(CLASS_NAME);
+    let class = wide(&class_name());
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: 0,
@@ -990,6 +1085,8 @@ pub fn run(args: &[String]) -> i32 {
             sticky_ttl: 0,
             icons: [null_mut(); 3],
             icon_size: 0,
+            icons_mascot: false,
+            mascot: mascot_enabled(),
             shown: None,
             added: false,
             polling: false,
@@ -1091,6 +1188,47 @@ mod tests {
         let m = menu_model(&View::Unreachable { installed: true, reason: "servis çalışmıyor".into() });
         assert_eq!(m.lines[0], "Korunan bağlantı: –");
         assert_eq!(m.error.as_deref(), Some("servis çalışmıyor"));
+    }
+
+    #[test]
+    fn mascot_setting_default_and_parse() {
+        assert!(parse_mascot(None));
+        assert!(parse_mascot(Some(1)));
+        assert!(parse_mascot(Some(7)));
+        assert!(!parse_mascot(Some(0)));
+    }
+
+    #[test]
+    fn resource_ids_per_state() {
+        assert_eq!(resource_id(IconState::On), 1);
+        assert_eq!(resource_id(IconState::Off), 2);
+        assert_eq!(resource_id(IconState::Problem), 3);
+    }
+
+    #[test]
+    fn menu_order_and_mascot_item() {
+        let ids = |m: &[MenuEntry]| m.iter().map(|e| e.text.clone()).collect::<Vec<_>>();
+        let m = menu_entries(&View::Live(live(true, true)), true, false);
+        assert_eq!(
+            ids(&m),
+            ["Açık", "Korunan bağlantı: 12", "Kurtarılan bağlantı: 3", "DNS yanıtı: 40", "", "Windows açılışında başlat", "Maskot simgesi", "SONdpi'yi kaldır…", "", "Çıkış"]
+        );
+        let at = |t: &str| m.iter().find(|e| e.text == t).unwrap();
+        assert_eq!(at("Açık").checked, Some(true));
+        assert_eq!(at("Windows açılışında başlat").checked, Some(true));
+        assert_eq!(at("Maskot simgesi").checked, Some(false));
+        assert!(!at("Maskot simgesi").grayed && !at("Maskot simgesi").separator);
+        assert!(m[1..4].iter().all(|e| e.grayed));
+        assert_eq!(m.iter().filter(|e| e.separator).count(), 2);
+        // An error adds one disabled line after the counters; the mascot item stays under autostart.
+        let mut e = live(false, false);
+        e.error = Some("boom".into());
+        let m = menu_entries(&View::Live(e), false, true);
+        assert_eq!(m[4].text, "boom");
+        assert!(m[4].grayed);
+        let pos = |t: &str| m.iter().position(|x| x.text == t).unwrap();
+        assert_eq!(pos("Maskot simgesi"), pos("Windows açılışında başlat") + 1);
+        assert_eq!(m[pos("Maskot simgesi")].checked, Some(true));
     }
 
     #[test]

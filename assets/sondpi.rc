@@ -1,0 +1,28 @@
+#pragma code_page(65001)
+1 ICON "icons\\acik.ico"
+2 ICON "icons\\kapali.ico"
+3 ICON "icons\\sorun.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,1,1,0
+PRODUCTVERSION 0,1,1,0
+FILEOS 0x40004L
+FILETYPE 0x1L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "041F04B0"
+    BEGIN
+      VALUE "ProductName", "SONdpi"
+      VALUE "FileDescription", "SONdpi"
+      VALUE "FileVersion", "0.1.1"
+      VALUE "ProductVersion", "0.1.1"
+      VALUE "OriginalFilename", "sondpi.exe"
+      VALUE "LegalCopyright", "MIT"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x041F, 0x04B0
+  END
+END

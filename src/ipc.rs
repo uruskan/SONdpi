@@ -1,4 +1,4 @@
-﻿//! Named-pipe control channel between the tray (client, unelevated) and the service (server).
+//! Named-pipe control channel between the tray (client, unelevated) and the service (server).
 //!
 //! Protocol: UTF-8 lines over a byte-mode pipe. A client sends one request line (`status`, `on`
 //! or `off`) and reads one reply line. The server keeps reading further request lines from the
@@ -453,7 +453,7 @@ pub struct Server {
 impl Server {
     /// Create the pipe (failing if another server already owns the name) and start serving.
     pub fn start(ctl: Arc<dyn EngineControl>, stop: &StopSignal) -> Result<Server, String> {
-        Server::start_on(api::PIPE_NAME, ctl, stop)
+        Server::start_on(&default_pipe_name(), ctl, stop)
     }
 
     pub fn start_on(pipe_name: &str, ctl: Arc<dyn EngineControl>, stop: &StopSignal) -> Result<Server, String> {
@@ -578,6 +578,16 @@ fn serve_client(h: HANDLE, ev: &Event, ctl: &dyn EngineControl, stop: &StopSigna
 // Client
 // ---------------------------------------------------------------------------------------------
 
+/// [`api::PIPE_NAME`], or the value of the `SONDPI_PIPE` environment variable when it names a
+/// pipe starting with `\\.\pipe\sondpi` (development only: lets a mock service run next to the
+/// real one).
+pub fn default_pipe_name() -> String {
+    match std::env::var("SONDPI_PIPE") {
+        Ok(v) if v.to_lowercase().starts_with(r"\\.\pipe\sondpi") => v,
+        _ => api::PIPE_NAME.to_string(),
+    }
+}
+
 /// Send `cmd` (`status`, `on`, `off`) and return the resulting status. `timeout_ms` covers the
 /// whole exchange. Used by the tray.
 pub fn request(cmd: &str, timeout_ms: u32) -> Result<Status, String> {
@@ -586,7 +596,7 @@ pub fn request(cmd: &str, timeout_ms: u32) -> Result<Status, String> {
 
 /// Like [`request`] but says why it failed.
 pub fn request_ex(cmd: &str, timeout_ms: u32) -> Result<Status, ReqError> {
-    request_on(api::PIPE_NAME, cmd, timeout_ms)
+    request_on(&default_pipe_name(), cmd, timeout_ms)
 }
 
 pub fn request_on(pipe_name: &str, cmd: &str, timeout_ms: u32) -> Result<Status, ReqError> {

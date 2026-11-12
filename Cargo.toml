@@ -1,6 +1,6 @@
 [package]
 name = "sondpi"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Tek tıkla DPI atlatma: TLS/HTTP desync, yanıtsız bağlantıyı yeniden deneme, temiz DNS"
 license = "MIT"

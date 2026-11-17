@@ -80,18 +80,37 @@ impl Resolver {
         if dns::policy_pass(&labels) {
             return system(&name);
         }
-        let (v6, v4) = std::thread::scope(|s| {
-            let h = std::thread::Builder::new().stack_size(128 * 1024).spawn_scoped(s, || self.query(&name, dns::TYPE_AAAA));
-            let v4 = self.query(&name, dns::TYPE_A);
+        let cached = (self.cached(&name, dns::TYPE_AAAA), self.cached(&name, dns::TYPE_A));
+        let (v6, v4) = if let (Some(v6), Some(v4)) = cached {
+            (Some(v6), Some(v4))
+        } else {
+            self.query_both(&name)
+        };
+        self.finish(&name, v6, v4)
+    }
+
+    fn cached(&self, name: &str, qtype: u16) -> Option<Vec<u8>> {
+        let key = dns::parse_query(&dns::build_query(name, qtype, 0)?)?.key();
+        lock(&self.cache).get(&key, (self.clock)())
+    }
+
+    /// AAAA on a second thread, A on this one.
+    fn query_both(&self, name: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        std::thread::scope(|s| {
+            let h = std::thread::Builder::new().stack_size(128 * 1024).spawn_scoped(s, || self.query(name, dns::TYPE_AAAA));
+            let v4 = self.query(name, dns::TYPE_A);
             let v6 = match h {
                 Ok(h) => h.join().unwrap_or(None),
-                Err(_) => self.query(&name, dns::TYPE_AAAA),
+                Err(_) => self.query(name, dns::TYPE_AAAA),
             };
             (v6, v4)
-        });
+        })
+    }
+
+    fn finish(&self, name: &str, v6: Option<Vec<u8>>, v4: Option<Vec<u8>>) -> io::Result<Vec<IpAddr>> {
         if v6.is_none() && v4.is_none() {
             self.fallbacks.fetch_add(1, Ordering::Relaxed);
-            return system(&name);
+            return system(name);
         }
         self.answered.fetch_add(1, Ordering::Relaxed);
         let mut out = Vec::new();
@@ -172,8 +191,22 @@ impl Resolver {
     }
 }
 
-/// The system resolver (getaddrinfo), IPv6 first.
+/// Longest wait for the system resolver; getaddrinfo itself has no timeout.
+const SYSTEM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The system resolver (getaddrinfo), IPv6 first, given at most [`SYSTEM_TIMEOUT`] (a
+/// lookup still running then finishes on its own thread and is discarded).
 fn system(name: &str) -> io::Result<Vec<IpAddr>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let n = name.to_string();
+    std::thread::Builder::new().name("sondpi-getaddrinfo".into()).stack_size(256 * 1024).spawn(move || {
+        let _ = tx.send(system_blocking(&n));
+    })?;
+    rx.recv_timeout(SYSTEM_TIMEOUT)
+        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, format!("{name}: system resolver timed out"))))
+}
+
+fn system_blocking(name: &str) -> io::Result<Vec<IpAddr>> {
     let mut v: Vec<IpAddr> = Vec::new();
     for a in (name, 0u16).to_socket_addrs()? {
         if !v.contains(&a.ip()) {

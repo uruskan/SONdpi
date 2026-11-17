@@ -155,10 +155,20 @@ pub fn parse_http(buf: &[u8]) -> Result<Option<(HttpAsk, usize)>, &'static str> 
     }
     let target = Target::parse_authority(authority, 80).ok_or("bad request target")?;
 
+    // Hop-by-hop headers, including those the client names in Connection (RFC 9110 7.6.1).
+    let mut hop: Vec<String> = ["proxy-connection", "proxy-authorization", "connection", "keep-alive", "upgrade", "te"]
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+    for (k, v) in &headers {
+        if k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("proxy-connection") {
+            hop.extend(v.split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()));
+        }
+    }
     let mut out = format!("{method} {path} {version}\r\n");
     let mut has_host = false;
     for (k, v) in &headers {
-        let drop = ["proxy-connection", "proxy-authorization", "connection", "keep-alive"].iter().any(|d| k.eq_ignore_ascii_case(d));
+        let drop = hop.iter().any(|d| k.eq_ignore_ascii_case(d));
         if drop {
             continue;
         }
@@ -489,29 +499,39 @@ fn read_more(s: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<bool> {
     Ok(n > 0)
 }
 
+/// Read once more into `buf` before `deadline`; false at EOF, error or when time is up.
+fn read_head(s: &mut TcpStream, buf: &mut Vec<u8>, deadline: Instant) -> bool {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() || s.set_read_timeout(Some(left)).is_err() {
+        return false;
+    }
+    read_more(s, buf).unwrap_or(false)
+}
+
 fn serve(sh: &Shared, mut client: TcpStream) {
     let _ = client.set_nodelay(true);
-    let _ = client.set_read_timeout(Some(HEAD_TIMEOUT));
+    // The whole request head (or SOCKS handshake) must arrive within HEAD_TIMEOUT.
+    let deadline = Instant::now() + HEAD_TIMEOUT;
     let mut buf = Vec::with_capacity(2048);
-    match read_more(&mut client, &mut buf) {
-        Ok(true) => {}
-        _ => return,
+    if !read_head(&mut client, &mut buf, deadline) {
+        return;
     }
     if buf[0] == 5 {
-        serve_socks(sh, client, buf);
+        serve_socks(sh, client, buf, deadline);
     } else {
-        serve_http(sh, client, buf);
+        serve_http(sh, client, buf, deadline);
     }
 }
 
-fn serve_http(sh: &Shared, mut client: TcpStream, mut buf: Vec<u8>) {
+fn serve_http(sh: &Shared, mut client: TcpStream, mut buf: Vec<u8>, deadline: Instant) {
     let (ask, n) = loop {
         match parse_http(&buf) {
             Ok(Some(x)) => break x,
-            Ok(None) => match read_more(&mut client, &mut buf) {
-                Ok(true) => {}
-                _ => return,
-            },
+            Ok(None) => {
+                if !read_head(&mut client, &mut buf, deadline) {
+                    return;
+                }
+            }
             Err(e) => {
                 sh.log(|| format!("http: {e}"));
                 let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -556,14 +576,15 @@ fn serve_http(sh: &Shared, mut client: TcpStream, mut buf: Vec<u8>) {
     }
 }
 
-fn serve_socks(sh: &Shared, mut client: TcpStream, mut buf: Vec<u8>) {
+fn serve_socks(sh: &Shared, mut client: TcpStream, mut buf: Vec<u8>, deadline: Instant) {
     let (no_auth, n) = loop {
         match parse_socks_greeting(&buf) {
             Ok(Some(x)) => break x,
-            Ok(None) => match read_more(&mut client, &mut buf) {
-                Ok(true) => {}
-                _ => return,
-            },
+            Ok(None) => {
+                if !read_head(&mut client, &mut buf, deadline) {
+                    return;
+                }
+            }
             Err(_) => return,
         }
     };
@@ -581,10 +602,11 @@ fn serve_socks(sh: &Shared, mut client: TcpStream, mut buf: Vec<u8>) {
         }
         match parse_socks_request(&buf) {
             Ok(Some(x)) => break x,
-            Ok(None) => match read_more(&mut client, &mut buf) {
-                Ok(true) => {}
-                _ => return,
-            },
+            Ok(None) => {
+                if !read_head(&mut client, &mut buf, deadline) {
+                    return;
+                }
+            }
             Err(code) => {
                 let _ = client.write_all(&socks_reply(code));
                 return;
@@ -625,7 +647,8 @@ fn open_err(sh: &Shared, target: &Target) -> io::Result<TcpStream> {
             Host::Name(n) => sh.resolver.lookup(n)?,
         };
         let addrs: Vec<SocketAddr> = ips.iter().map(|ip| SocketAddr::new(*ip, target.port)).collect();
-        if addrs.iter().any(|a| *a == sh.addr || (a.ip().is_unspecified() && a.port() == sh.addr.port())) {
+        let own_port = |a: &SocketAddr| a.port() == sh.addr.port() && (a.ip().is_loopback() || a.ip().is_unspecified() || a.ip() == sh.addr.ip());
+        if addrs.iter().any(own_port) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to connect to the proxy itself"));
         }
         let t1 = t0.elapsed();
@@ -784,6 +807,9 @@ mod tests {
         let (ask, _) = parse_http(b"GET http://a.b?x HTTP/1.1\r\nHost: a.b\r\n\r\n").unwrap().unwrap();
         let HttpAsk::Forward { head, .. } = ask else { panic!() };
         assert!(head.starts_with(b"GET /?x HTTP/1.1\r\n"));
+        let (ask, _) = parse_http(b"GET http://a.b/ HTTP/1.1\r\nHost: a.b\r\nConnection: Upgrade, X-Hop\r\nUpgrade: websocket\r\nX-Hop: 1\r\nX-Keep: 2\r\n\r\n").unwrap().unwrap();
+        let HttpAsk::Forward { head, .. } = ask else { panic!() };
+        assert_eq!(String::from_utf8(head).unwrap(), "GET / HTTP/1.1\r\nHost: a.b\r\nX-Keep: 2\r\nConnection: close\r\n\r\n");
         assert!(parse_http(b"GET https://a.b/ HTTP/1.1\r\n\r\n").is_err());
         assert!(parse_http(b"GET http://u:p@a.b/ HTTP/1.1\r\n\r\n").is_err());
         assert!(parse_http(b"GET ftp://a.b/ HTTP/1.1\r\n\r\n").is_err());
@@ -965,11 +991,15 @@ mod tests {
         let mut c = TcpStream::connect(p.addr()).unwrap();
         c.write_all(format!("CONNECT {} HTTP/1.1\r\n\r\n", p.addr()).as_bytes()).unwrap();
         assert!(read_all(&mut c).starts_with(b"HTTP/1.1 502"));
+        // the proxy's port on another loopback form: refused too
+        let mut c = TcpStream::connect(p.addr()).unwrap();
+        c.write_all(format!("CONNECT 127.0.0.2:{} HTTP/1.1\r\n\r\n", p.addr().port()).as_bytes()).unwrap();
+        assert!(read_all(&mut c).starts_with(b"HTTP/1.1 502"));
         // garbage: 400
         let mut c = TcpStream::connect(p.addr()).unwrap();
         c.write_all(b"HELLO\r\n\r\n").unwrap();
         assert!(read_all(&mut c).starts_with(b"HTTP/1.1 400"));
-        assert_eq!(p.stats().failed, 2);
+        assert_eq!(p.stats().failed, 3);
     }
 
     #[test]

@@ -63,9 +63,10 @@ extern "C" {
 /// I/O callbacks: SecureTransport asks for exactly `*len` bytes; a short count is an error
 /// here because the socket is blocking (with a timeout).
 unsafe extern "C" fn st_read(conn: SSLConnectionRef, data: *mut c_void, len: *mut usize) -> OSStatus {
-    // SAFETY: `conn` is the `TcpStream` boxed in `Tls`, alive while the context is; `data`
-    // and `*len` describe a buffer SecureTransport owns for the duration of this call.
+    // SAFETY: `conn` is the `TcpStream` boxed in `Tls`, alive while the context is; `len` is
+    // a valid in/out pointer for this call.
     let (stream, want) = unsafe { (&*(conn as *const TcpStream), *len) };
+    // SAFETY: `data` points to `want` writable bytes SecureTransport owns during this call.
     let buf = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, want) };
     let mut got = 0;
     let status = loop {
@@ -85,8 +86,9 @@ unsafe extern "C" fn st_read(conn: SSLConnectionRef, data: *mut c_void, len: *mu
 }
 
 unsafe extern "C" fn st_write(conn: SSLConnectionRef, data: *const c_void, len: *mut usize) -> OSStatus {
-    // SAFETY: as in `st_read`, for a buffer SecureTransport only reads.
+    // SAFETY: as in `st_read`: `conn` is our boxed stream, `len` a valid pointer.
     let (stream, want) = unsafe { (&*(conn as *const TcpStream), *len) };
+    // SAFETY: `data` points to `want` readable bytes SecureTransport owns during this call.
     let buf = unsafe { std::slice::from_raw_parts(data as *const u8, want) };
     let status = match (&*stream).write_all(buf) {
         Ok(()) => 0,

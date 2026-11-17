@@ -37,7 +37,9 @@ pub mod redial;
 
 pub mod dns;
 
+pub mod dial;
 pub mod proxy;
+pub mod resolve;
 
 #[cfg(windows)]
 pub mod divert;
@@ -58,3 +60,6 @@ pub mod ipc;
 pub mod service;
 #[cfg(windows)]
 pub mod tray;
+
+#[cfg(target_os = "macos")]
+pub mod macos;

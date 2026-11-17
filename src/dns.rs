@@ -432,8 +432,9 @@ pub fn build_reply(query: &Packet, response: &[u8]) -> Option<Packet> {
     query.udp_reply(&r)
 }
 
-/// An upstream answer we are willing to hand to the client for `key`.
-fn acceptable(resp: &[u8], key: &Key) -> bool {
+/// An upstream answer we are willing to hand to the client for `key`: a response, NOERROR
+/// or NXDOMAIN, same question, parseable records.
+pub fn acceptable(resp: &[u8], key: &Key) -> bool {
     if resp.len() < 12 || resp[2] & 0x80 == 0 {
         return false;
     }

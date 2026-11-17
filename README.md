@@ -4,18 +4,18 @@
   <img src="assets/sondpi-chan.svg" width="280" alt="SONdpi maskotu: saçında açık konumda bir anahtar tokası olan mor saçlı karakter">
 </p>
 
-<h3 align="center">Windows için tek anahtarlı DPI atlatma aracı</h3>
+<h3 align="center">Windows ve macOS için tek anahtarlı DPI atlatma aracı</h3>
 
 <p align="center">
   Discord, Roblox ve benzeri sitelere erişimi engelleyen derin paket incelemesini (DPI) atlatır.<br>
-  Bildirim alanında durur: bir tık açar, bir tık kapatır. Terminal yok, ayar dosyası yok.
+  Bildirim alanında (Mac'te menü çubuğunda) durur: tek anahtar. Terminal yok, ayar dosyası yok.
 </p>
 
 <p align="center">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20macOS%2011%2B-0078D6">
   <img alt="Dil" src="https://img.shields.io/badge/dil-Rust-b7410e">
   <img alt="Lisans" src="https://img.shields.io/badge/lisans-MIT-2ea44f">
-  <img alt="Testler" src="https://img.shields.io/badge/birim%20testi-131%20ge%C3%A7iyor-2ea44f">
+  <img alt="Testler" src="https://img.shields.io/badge/birim%20testi%20(macOS)-124%20ge%C3%A7iyor-2ea44f">
   <img alt="Sürüm" src="https://img.shields.io/github/v/release/uruskan/SONdpi?include_prereleases&label=s%C3%BCr%C3%BCm">
   <img alt="Terminal" src="https://img.shields.io/badge/terminal-gerekmez-8250df">
   <img alt="Baba" src="https://img.shields.io/badge/babayla-yar%C4%B1%C5%9F%C4%B1lmaz-ff69b4">
@@ -111,6 +111,36 @@ Paket yakalama için [WinDivert](https://reqrypt.org/windivert.html) sürücüs�
   <img src="assets/ekran/menu-sorun.png" alt="Sağ tık menüsü, sorun var: endişeli maskot" width="213">
 </p>
 
+## macOS
+
+Mac'te paket yakalayan bir sürücü yok (WinDivert'in karşılığı Apple'ın geliştirici sertifikası ve onayı ister), o yüzden Mac sürümü aynı işi başka yoldan yapar: anahtar açılınca bilgisayarın içinde (`127.0.0.1`) küçük bir proxy çalışır ve macOS'un "otomatik proxy yapılandırması" ona yönlendirilir. Proxy her bağlantıda:
+
+- **adı DoH ile çözer** (Cloudflare ve Google, şifreli); modemin zehirli DNS'ine hiç sormaz;
+- **yanıtsız bağlantıyı yeniden arar:** 250 ms'de SYN-ACK gelmezse yeni bir soketle (yeni kaynak portuyla) ikinci deneme başlar, ilk kurulan kazanır;
+- **ClientHello'yu ikiye böler:** tek TLS kaydını, sitenin adının ortasından iki TLS kaydına ayırıp iki ayrı TCP parçası olarak yollar. Düz HTTP'de `Host:` başlığını `hoSt:` yazar ve adı böler.
+
+Sahte paket (TTL hilesi) yönetici hakkı ister; ölçtüğümüz hatta buna gerek kalmadı, çünkü DPI TLS kayıtlarını birleştirmiyor.
+
+**Kurulum:** [Sürümler](https://github.com/uruskan/SONdpi/releases) sayfasından `SONdpi-…-macos-universal.zip`'i indir, aç, `SONdpi.app`'i Uygulamalar'a sürükle. Uygulama Apple'a kayıtlı bir sertifikayla imzalı olmadığı için ilk açılışta macOS engeller: macOS 15 ve sonrasında Sistem Ayarları > Gizlilik ve Güvenlik > "Yine de Aç"; daha eskilerde sağ tık > Aç. Apple Silicon ve Intel için tek paket (Intel'de denenmedi).
+
+**Kullanım:** menü çubuğundaki maskota tıkla; menü Windows'takiyle aynıdır, yalnızca sağ tık yerine sol tıkla açılır. "Açık" ile aç/kapat. macOS ilk seferde yönetici şifresi isteyebilir (proxy ayarı için).
+
+**Kapatınca ya da Çıkış'ta** proxy ayarı eski hâline döner. Değiştirmeden önce özgün ayar bir dosyaya yazılır; uygulama çökerse bir sonraki açılışta düzeltilir, o arada da internet kesilmez (tarayıcılar proxy'ye ulaşamayınca doğrudan bağlanır; `kill -9` ile denendi).
+
+**Sınırı:** yalnızca sistem proxy ayarına uyan uygulamalar kapsanır: Safari, Chrome, Firefox (varsayılan ayarıyla), Discord'un masaüstü uygulaması gibi. Proxy ayarını yok sayan uygulamalar ve UDP (sesli görüşme, QUIC) proxy'den geçmez.
+
+**Bu hatta ölçtüklerimiz (Turkcell 5G, 17 Kasım 2026, MacBook, `tools/hat-testi-macos.sh`):**
+
+| Ölçüm | Proxy'siz | SONdpi (Mac) |
+|---|---|---|
+| Engelli adlara HTTPS (discord.com, gateway.discord.gg, cdn.discordapp.com, www.roblox.com) | 0/6 | **120/120** (ortanca 0,3-0,6 sn) |
+| Cloudflare IPv4'e bağlantı, 1 sn'yi aşan ya da kurulamayan | 7/120 | **0/120** (15'i yeniden aramayla kurtarıldı) |
+| Sistem proxy'si üzerinden Safari'nin ağ yığını (URLSession): discord.com, roblox | açılmıyor | açılıyor |
+| 22 popüler site (Google, Apple, GitHub, YouTube, Instagram, X…) | | bozulma yok |
+| İndirme / yükleme hızı | | proxy'sizle aynı (hat çok dalgalı, ±2 kat) |
+
+Sınanmayanlar: Discord ve Roblox uygulamaları (bu Mac'te kurulu değil), sesli kanal, Intel Mac, başka servis sağlayıcılar, uzun süreli kullanım.
+
 ## Bu hatta ne ölçtük
 
 Aracı tahminle değil ölçümle yazdık. Kasım 2026, Turkcell 5G ev interneti:
@@ -161,7 +191,7 @@ Turkcell 5G'de ölçüldü. Türk Telekom, Superonline, Vodafone ve diğerlerind
 Bağlantının ilk paketlerine, DNS sorgularına ve yeniden aranan bağlantılara dokunur; geri kalan trafik olduğu gibi akar. Ölçtüğümüz hatta 25 MB'lık indirme GoodbyeDPI ile 17,1, SONdpi ile 16,2 MB/sn çıktı (tek ölçüm).
 
 **Kapatınca ne olur?**
-Açmadan önce ne idiyse o. Değiştirdiği bir sistem ayarı yok ki geri alsın.
+Açmadan önce ne idiyse o. Windows'ta değiştirdiği bir sistem ayarı yok ki geri alsın; Mac'te değiştirdiği tek ayar (otomatik proxy) eski hâline döner.
 
 **IP ile engellenen siteleri açar mı?**
 Hayır. Bu araç alan adına bakan engeli (SNI, Host, DNS) atlatır. Adresin kendisi engelliyse VPN gerekir.
@@ -179,6 +209,8 @@ Gecikme 4 ile 24 dakika arasında olacağı için yeniden arama eşiğini 250 ms
 - [ ] QUIC (HTTP/3) için yöntem
 - [ ] Discord sesli kanal (UDP) için yöntem, gerekiyorsa
 - [ ] Kurulum paketi ve imzalı sürüm
+- [x] macOS sürümü (proxy ile)
+- [ ] macOS: proxy ayarına uymayan uygulamalar için yol
 
 ## Kaynaktan derleme
 
@@ -193,6 +225,16 @@ cargo build --release
 
 `target\release\sondpi.exe` dosyasının yanına `vendor\windivert\` içindeki `WinDivert.dll` ve `WinDivert64.sys` dosyalarını kopyala.
 
+macOS'ta (Rust ve Xcode komut satırı araçları kurulu):
+
+```
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo test
+tools/macos-paket.sh        # target/macos/SONdpi-<sürüm>-macos-universal.zip
+```
+
+Ölçüm için proxy'yi sistem ayarına dokunmadan çalıştırmak: `target/release/sondpi dev`, sonra `curl -x http://127.0.0.1:18642 https://discord.com`.
+
 ## English
 
 **SONdpi** is a one-switch DPI circumvention tool for Windows 10/11, written in Rust. It lives in the notification area (system tray): one click on, one click off, no terminal and no configuration files. It is an alternative to GoodbyeDPI built for networks in Türkiye, where sites such as Discord and Roblox are blocked by SNI inspection and poisoned DNS.
@@ -202,6 +244,8 @@ cargo build --release
 - **DNS:** intercepted DNS queries are answered locally over DNS-over-HTTPS; no adapter settings are changed.
 - **Status:** early release; measured on one ISP so far. Built on the WinDivert driver.
 
+**macOS** (11+, Apple Silicon and Intel): a menu-bar app that runs a local proxy and points the system's automatic proxy configuration (PAC) at it while switched on. The proxy resolves names over DoH, races a fresh socket against a SYN that is unanswered after 250 ms, and re-frames the TLS ClientHello as two TLS records split inside the server name. No root, no driver; covers apps that honour the system proxy setting (browsers, the Discord desktop app). The setting is restored when switched off, and a crash leaves browsers falling back to direct connections.
+
 ## Teşekkür ve lisans
 
 - [GoodbyeDPI](https://github.com/ValdikSS/GoodbyeDPI) ve [zapret](https://github.com/bol-van/zapret): yöntemlerin çoğunu onlar buldu.
@@ -209,4 +253,4 @@ cargo build --release
 
 Kod [MIT](LICENSE) lisanslıdır. Aracı nasıl ve nerede kullandığın senin sorumluluğundadır.
 
-<sub>İlgili aramalar: DPI atlatma, DPI bypass, Discord engeli kaldırma, Discord'a girme, Roblox engeli, GoodbyeDPI alternatifi, GoodbyeDPI çalışmıyor, zapret Windows, SNI engeli, DNS zehirlenmesi, DoH, Turkcell, Türk Telekom, Superonline, Vodafone, Windows 11.</sub>
+<sub>İlgili aramalar: DPI atlatma, macOS DPI, Mac Discord engeli, DPI bypass, Discord engeli kaldırma, Discord'a girme, Roblox engeli, GoodbyeDPI alternatifi, GoodbyeDPI çalışmıyor, zapret Windows, SNI engeli, DNS zehirlenmesi, DoH, Turkcell, Türk Telekom, Superonline, Vodafone, Windows 11.</sub>

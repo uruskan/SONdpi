@@ -1,12 +1,13 @@
 # SONdpi
 
-Windows için tek anahtarla açılıp kapanan DPI atlatma aracı. GoodbyeDPI'nin yerini alır: kendi motoru vardır, sistem ayarına dokunmaz, bildirim alanında (sistem tepsisi) tek bir anahtar olarak durur. Kullanıcıya son mesajının dilinde yanıt ver (çoğunlukla Türkçe).
+Windows ve macOS için tek anahtarla açılıp kapanan DPI atlatma aracı. GoodbyeDPI'nin yerini alır: kendi motoru vardır, sistem ayarına dokunmaz, bildirim alanında (sistem tepsisi) tek bir anahtar olarak durur. Kullanıcıya son mesajının dilinde yanıt ver (çoğunlukla Türkçe).
 
 ## Kullanıcının kararları
 
 - Motor bizim: GoodbyeDPI'den daha iyi olacak. GoodbyeDPI açık kaynaktır (Apache-2.0); fikirleri kullanılır, kod Rust'ta baştan yazılır.
 - Terminal programı değil. Bildirim alanında basit bir anahtar: tek tıkla aç, tek tıkla kapat.
 - En üst kararlılık ve hız her zaman tercih edilir. Süre gerekçesiyle kapsam küçültme önerme.
+- macOS sürümü (2026-11-17): root ve sürücü yok; yerel proxy + sistemin otomatik proxy (PAC) ayarı. Kullanıcı bu yolu seçti (şeffaf pf/root yolu yerine). Menü, Windows tepsisindeki menünün birebir aynısıdır; tek fark Mac'te menünün sol tıkla açılmasıdır (kullanıcı açıkça istedi; başka fark ekleme, menüyü değiştirirken önce `src/tray.rs`'teki `menu_entries`/başlık çizimine bak).
 - Repo adı SONdpi. README başlığı yalnızca "SONdpi"dir (kullanıcı uzun, esprili başlığı 2026-11-13'te kaldırttı); "babayla yarışılmaz" rozeti ve maskot kalır. README'nin tonu esprili ama içeriği doğrudur: ölçülmemiş bir şey ölçülmüş gibi yazılmaz, gerçek kişilere söz uydurulmaz.
 - Repo public (2026-11-13). Commit'ler `uruskan` adı ve GitHub noreply adresiyle atılır; kullanıcının gerçek adı ve e-postası depoya, commit'lere ya da sürüm notlarına yazılmaz. Release çıkarmak ve dışarıdan dosya indirmek yalnızca kullanıcının onayıyla olur; ilk release, inceleme bulguları düzeltilip motor gerçek hatta sınandıktan sonra çıkar.
 
@@ -34,17 +35,28 @@ Bunlar tahmin değil, bu hatta yapılan ölçümlerdir. Başka servis sağlayıc
 
 **Maskot (2026-11-13, kullanıcının isteği).** Uygulamada maskot varsayılan olarak görünür: tepsi simgesi maskotun yüzüdür (açık: uyanık, kapalı: uyuyor, sorun: endişeli; köşe rozeti 16 pikselde durumu rengiyle söyler) ve sağ tık menüsünün en üstünde büyük portresi durur. Menüdeki "Maskot simgesi" kapatılırsa ikisi de gider. Çizimler `tools/ikon-uret.ps1` içindedir; `assets/` altındaki `.ico`, `.rc` ve `.res` ondan üretilir ve commit'lenir, `build.rs` `.res` dosyasını exe'ye bağlar. Menü yalnızca %100 ölçekte ve açık temada gözle görüldü.
 
-**Sürüm.** `v0.1.1` (maskot, GoodbyeDPI devri, yükseltmede tepsi değişimi) ve `v0.1.0` ön sürüm olarak yayınlandı (2026-11-13): `SONdpi-0.1.0-windows-x64.zip` (exe, WinDivert dosyaları, lisanslar, `OKU.txt`). Geliştirme bilgisayarında bu sürüm kalıcı olarak kurulu ve GoodbyeDPI kaldırıldı; yeni derlemeyi denemek için üstüne `sondpi.exe install` çalıştırılır.
+**Sürüm.** `v0.2.0-macos` (2026-11-17): ilk macOS ön sürümü, `SONdpi-0.2.0-macos-universal.zip` (SONdpi.app, `OKU-macOS.txt`, lisans); ad-hoc imzalı, notarize değil. `v0.1.1` (maskot, GoodbyeDPI devri, yükseltmede tepsi değişimi) ve `v0.1.0` ön sürüm olarak yayınlandı (2026-11-13): `SONdpi-0.1.0-windows-x64.zip` (exe, WinDivert dosyaları, lisanslar, `OKU.txt`). Geliştirme bilgisayarında bu sürüm kalıcı olarak kurulu ve GoodbyeDPI kaldırıldı; yeni derlemeyi denemek için üstüne `sondpi.exe install` çalıştırılır.
+
+**macOS hattı (2026-11-17, aynı Turkcell hattı, MacBook, yönetici hakkı olmadan; `tools/hat-testi-macos.sh`).**
+- Engelli SNI düz gönderilince zaman aşımı; TCP'de bölme ve TTL=1 "disorder" ~0,2-0,3 sn'de RST (Windows'taki gözlemle aynı).
+- ClientHello'yu SNI'nin ortasından **iki TLS kaydına** bölmek DPI'yı geçiyor (DPI kayıtları birleştirmiyor); OOB baytı da geçti. Proxy ile engelli adlar 120/120.
+- Düz HTTP'de Host değerini bölmek RST alıyor; başlık adını `hoSt:` yazmak geçiyor.
+- Kayıp SYN: Cloudflare IPv4'e 120 doğrudan bağlantının 7'si 1 sn'yi aştı ya da kurulamadı; proxy'nin yarışan yeniden aramasıyla 0/120 (15'i kurtarıldı).
+- DoH: Quad9 443'te HTTP/1.1'e 505 veriyor; Mac listesi 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 (SecureTransport, IP sertifikası doğrulanıyor).
+- Uçtan uca: sistem proxy'si üzerinden URLSession (Safari'nin yığını) engelli adları açıyor; SIGTERM'de ayar geri yükleniyor; `kill -9` sonrası internet doğrudan sürüyor, yeniden açılışta toparlanıyor. `networksetup` bu yönetici hesabında şifresiz çalıştı.
+- Akamai'nin bazı IPv6 uçları curl'ün varsayılan kullanıcı aracısına `/` için yanıt vermiyor (microsoft.com); proxy ile ilgisi yok.
 
 ## Mimari
 
-Tek dosya: `sondpi.exe`. Rolü argüman belirler (`src/main.rs`): argümansız tepsi anahtarı, `service` motoru barındıran Windows servisi, `dev` ölçüm için konsol kipi, `install` / `uninstall`.
+Windows: tek dosya `sondpi.exe`. Rolü argüman belirler (`src/main.rs`): argümansız tepsi anahtarı, `service` motoru barındıran Windows servisi, `dev` ölçüm için konsol kipi, `install` / `uninstall`.
 
 Motor üç iş yapar ve hiçbiri sistem ayarı değiştirmez; kapatınca her şey eski hâlindedir:
 
 1. **Desync.** Giden TLS ClientHello / HTTP isteğinin ilk paketini yakalar, önüne TTL'i sınırlı sahte istek koyar ve gerçeğini bölerek yollar.
 2. **Yeniden arama.** Yanıtsız kalan SYN'i yedek bir kaynak porttan yeniden yollar; kazanan yol için akışın bütün paketlerinde port çevirisi yapar. Uygulama hiçbir şey fark etmez (ISN ve seçenekler aynıdır).
 3. **DNS.** Giden UDP/53 sorgularını yakalar, yanıtı DoH ile alır ve asıl DNS sunucusundan gelmiş gibi içeri enjekte eder. Bağdaştırıcı ayarına dokunmaz; IPv4, IPv6 ve bağlantı-yerel adreslerde çalışır.
+
+macOS: `SONdpi.app` (evrensel ikili, `tools/macos-paket.sh`). Argümansız menü çubuğu uygulaması (`src/macos/app.rs`), `dev` sistem ayarına dokunmadan proxy'yi konsolda çalıştırır. Taşınabilir çekirdek: `proxy.rs` (HTTP CONNECT, mutlak HTTP, SOCKS5, PAC, ilk kaydı bölme), `dial.rs` (Happy Eyeballs + 250 ms'de yarışan yeniden arama), `resolve.rs` (DoH, önbellek, eşzamanlı sorgu birleştirme). Yalnızca macOS: `macos/doh.rs` (SecureTransport), `macos/sysproxy.rs` (networksetup; özgün ayar önce `~/Library/Application Support/SONdpi/proxy-saved.tsv`'ye yazılır, gerekirse yönetici diyaloğu), `macos/core.rs` (anahtar, iş parçacığı, 10 sn'de bir bekçi), `macos/objc.rs` (elle bildirilmiş Objective-C çalışma zamanı), `macos/autostart.rs` (LaunchAgent). Simgeler `tools/macos-ikon-uret.swift` ile SVG çizimlerinden üretilir ve commit'lenir.
 
 | Modül | İş | Sahibi |
 |---|---|---|
@@ -58,7 +70,7 @@ Modüller arası sözleşme, iskelet dosyalardaki `pub` imzalardır. İmzayı ge
 
 ## Kurallar
 
-- **Bağımlılık.** Tek crate `windows-sys`. Yeni crate ekleme. `Cargo.toml` içinde yalnızca `windows-sys` özellik listesine satır eklenebilir; başka hiçbir satıra dokunma.
+- **Bağımlılık.** Tek crate `windows-sys`, yalnızca Windows'ta (`[target.'cfg(windows)']`). Yeni crate ekleme. `Cargo.toml` içinde yalnızca `windows-sys` özellik listesine satır eklenebilir; başka hiçbir satıra dokunma (sürüm numarası lidere aittir). macOS sistem çağrıları (libc, Security, AppKit, Objective-C çalışma zamanı) kaynakta elle bildirilir.
 - **Dosya sahipliği.** Bir dosyaya aynı anda tek kişi yazar. Sana verilmeyen dosyaya dokunma; ihtiyacın varsa raporunda yaz.
 - **Derleme klasörü.** Her işçi kendi `CARGO_TARGET_DIR` klasörünü kullanır (görevinde yazar); varsayılan `target/` lidere aittir.
 - **Yönetici hakkı.** İşçiler yönetici gerektiren hiçbir şey çalıştırmaz, servis kurmaz, sürücü yüklemez, sistem ayarı değiştirmez. Motorun gerçek hatta denenmesi lidere aittir ve her deneme kullanıcının onayıyla yapılır.
@@ -69,7 +81,7 @@ Modüller arası sözleşme, iskelet dosyalardaki `pub` imzalardır. İmzayı ge
 
 ## Derleme ve test
 
-- `cargo test` saf mantığı sınar; `cargo build --release` exe'yi üretir. Uyarısız derlenmeli.
+- `cargo test` saf mantığı sınar; `cargo build --release` exe'yi üretir. Uyarısız derlenmeli. Mac'te Windows kodunu da denetle: `cargo check --target x86_64-pc-windows-msvc --all-targets`.
 - Gerçek hat ölçümleri `tools/` altındaki Node betikleriyle yapılır (yalnızca geliştirme için): `probe.js` (TLS el sıkışması, gerçek IP'ye sabitlenmiş), `synprobe.js` (yalnızca TCP bağlantısı; kayıp SYN oranı), `tuple.js` (aynı kaynak portu yeniden deneme).
 - Motoru denemek yönetici hakkı ister. Açık kalan, istek dinleyen yönetici yardımcısı kurma: bu yol güvenliği zayıflattığı için reddedildi (2026-11-13). Her deneme, ne yapacağı önceden kullanıcıya söylenen ve kullanıcının onayladığı tek seferlik bir çalıştırmadır: motoru belli bir süre açar, ölçer, kapatır ve çıkar.
 - Bu makinede kurulu `GoodbyeDPI` servisi motorla aynı anda çalışmamalı; deneme sırasında durdurulur, deneme bitince yeniden başlatılır (kullanıcının interneti ona bağlı).

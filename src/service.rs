@@ -32,8 +32,10 @@ use windows_sys::Win32::System::Services::{
     SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetExitCodeProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 
 /// How long the engine may take to shut down before the service reports stopped anyway.
 const ENGINE_STOP_BUDGET: Duration = Duration::from_secs(15);
@@ -240,10 +242,10 @@ impl EngineControl for MockControl {
 // Tray at logon
 // ---------------------------------------------------------------------------------------------
 //
-// Windows does not always run the HKCU Run entry at logon (seen 2026-11-16: the Run pass ran no
-// command at all), so the service also starts the tray in every new user session. The tray
-// checks the user's own "start with Windows" choice and exits if it is off; its single-instance
-// mutex makes a second start (Run entry and service both firing) harmless.
+// A second path besides the HKCU Run entry: the service starts the tray in every new user session
+// and, when it starts itself, in sessions already at the desktop (after an upgrade or a restart).
+// The tray checks the user's own "start with Windows" choice and exits if it is off; its
+// single-instance mutex makes a second start (Run entry and service both firing) harmless.
 
 /// `WTS_SESSION_LOGON` from the session-change notification.
 const WTS_SESSION_LOGON: u32 = 5;
@@ -306,12 +308,27 @@ fn launch_tray(session: u32) -> Result<(), String> {
             DestroyEnvironmentBlock(env);
         }
         if ok {
-            CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
         }
         CloseHandle(token);
     }
-    if ok { Ok(()) } else { Err(format!("tepsi başlatılamadı ({err})")) }
+    if ok {
+        log(&format!("oturum {session}: tepsi başlatıldı (pid {})", pi.dwProcessId));
+        // A tray that ends within seconds either found another one running or was told by the
+        // user's setting not to start; anything else is worth a log line.
+        // SAFETY: pi.hProcess is ours until closed here.
+        unsafe {
+            if WaitForSingleObject(pi.hProcess, 10_000) == WAIT_OBJECT_0 {
+                let mut code = 0u32;
+                GetExitCodeProcess(pi.hProcess, &mut code);
+                log(&format!("oturum {session}: tepsi hemen kapandı (çıkış kodu {code})"));
+            }
+            CloseHandle(pi.hProcess);
+        }
+        Ok(())
+    } else {
+        Err(format!("tepsi başlatılamadı ({err})"))
+    }
 }
 
 fn launch_tray_logged(session: u32) {
@@ -329,6 +346,8 @@ fn active_sessions() -> Vec<u32> {
     let mut count = 0u32;
     // SAFETY: valid out pointers; the array is freed below.
     if unsafe { WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut info, &mut count) } == 0 {
+        // SAFETY: trivial.
+        log(&format!("oturumlar listelenemedi ({})", unsafe { GetLastError() }));
         return vec![];
     }
     // SAFETY: the call succeeded, so info points to `count` entries.

@@ -46,6 +46,10 @@ Bunlar tahmin değil, bu hatta yapılan ölçümlerdir. Başka servis sağlayıc
 - Uçtan uca: sistem proxy'si üzerinden URLSession (Safari'nin yığını) engelli adları açıyor; SIGTERM'de ayar geri yükleniyor; `kill -9` sonrası internet doğrudan sürüyor, yeniden açılışta toparlanıyor. Anahtarı kullanıcı açtı; `networksetup`'ın şifre isteyip istemediği not edilmedi.
 - Akamai'nin bazı IPv6 uçları curl'ün varsayılan kullanıcı aracısına `/` için yanıt vermiyor (microsoft.com); proxy ile ilgisi yok.
 
+**Paketli uygulamadan kurulum tuzağı (2026-11-18).** Claude masaüstü uygulaması MSIX paketlidir: ondan ve onun başlattığı süreçlerden yapılan HKCU yazımları pakete özel bir kayıt kopyasına gider, dışarıdaki süreçler (Explorer, servis) onu görmez. 2026-11-13'teki kurulum `Run\SONdpi` girdisini yalnızca o kopyaya yazdığı için 2026-11-16 yeniden başlatmasında tepsi açılmadı. Bu kabuktan HKCU'ya bakan her şey (PowerShell, `reg`, buradan başlatılan tepsi) yanıltıcıdır; gerçek değeri okumak ya da yazmak için komut paket dışında çalıştırılır (ör. `Invoke-CimMethod Win32_Process Create` ile `reg query`/`reg add`), tepsi de aynı yolla başlatılır. Buradan çalıştırılan `sondpi.exe install` sonrasında Run girdisi bu yolla doğrulanır.
+
+**Tepsiyi servis de açar (2026-11-18).** Servis oturum açılışında (`SERVICE_CONTROL_SESSIONCHANGE`, `WTS_SESSION_LOGON`) ve kendi başlangıcında etkin oturumlarda tepsiyi kullanıcı olarak `--autostart` ile başlatır; tepsi kullanıcının Run girdisi yoksa 11 koduyla çıkar, zaten çalışıyorsa 10. Servis, 10 sn içinde kapanan tepsinin çıkış kodunu `service.log`'a yazar. Servis başlangıcı yolu sınandı; oturum açılışı yolu henüz sınanmadı.
+
 ## Mimari
 
 Windows: tek dosya `sondpi.exe`. Rolü argüman belirler (`src/main.rs`): argümansız tepsi anahtarı, `service` motoru barındıran Windows servisi, `dev` ölçüm için konsol kipi, `install` / `uninstall`.

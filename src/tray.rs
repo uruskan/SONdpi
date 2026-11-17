@@ -1302,6 +1302,11 @@ fn run_ctl(args: &[String]) -> i32 {
     }
 }
 
+/// Exit codes that say why a tray ended without showing itself (read in the service log).
+pub const EXIT_ALREADY_RUNNING: i32 = 10;
+pub const EXIT_AUTOSTART_OFF: i32 = 11;
+pub const EXIT_MESSAGE_LOOP_FAILED: i32 = 12;
+
 /// Entry point for plain `sondpi`; returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("ctl") {
@@ -1311,7 +1316,7 @@ pub fn run(args: &[String]) -> i32 {
     // (the HKCU Run entry) decides whether the tray stays.
     let autostart = args.iter().any(|a| a == "--autostart");
     if autostart && !install::autostart_enabled() {
-        return 0;
+        return EXIT_AUTOSTART_OFF;
     }
     let no_setup = autostart || args.iter().any(|a| a == "--no-setup");
     // A leftover of an earlier upgrade (best effort; needs write access to the install folder).
@@ -1325,7 +1330,7 @@ pub fn run(args: &[String]) -> i32 {
     let mutex = unsafe { CreateMutexW(null(), 0, mname.as_ptr()) };
     // SAFETY: trivial.
     if mutex.is_null() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        return 0;
+        return EXIT_ALREADY_RUNNING;
     }
 
     // SAFETY: null module name = this executable.
@@ -1394,9 +1399,18 @@ pub fn run(args: &[String]) -> i32 {
 
     // SAFETY: all-zero is a valid MSG.
     let mut msg: MSG = unsafe { std::mem::zeroed() };
+    let mut code = 0;
     // SAFETY: standard message loop on the thread that owns the window.
     unsafe {
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+        loop {
+            let r = GetMessageW(&mut msg, null_mut(), 0, 0);
+            if r == 0 {
+                break;
+            }
+            if r < 0 {
+                code = EXIT_MESSAGE_LOOP_FAILED;
+                break;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1411,7 +1425,7 @@ pub fn run(args: &[String]) -> i32 {
     });
     // SAFETY: closes the mutex handle; the instance guard ends with the process anyway.
     unsafe { CloseHandle(mutex) };
-    0
+    code
 }
 
 #[cfg(test)]

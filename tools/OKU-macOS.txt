@@ -1,0 +1,43 @@
+SONdpi (macOS)
+==============
+
+Discord, Roblox ve benzeri engelli sitelere erişim için tek anahtarlı DPI atlatma aracı.
+Menü çubuğunda maskot olarak durur: tıkla aç, tıkla kapat.
+
+KURULUM
+1. Zip'i açın, SONdpi.app'i Uygulamalar (Applications) klasörüne sürükleyin.
+2. SONdpi.app'i açın. Uygulama Apple'a kayıtlı bir geliştirici sertifikasıyla imzalı
+   olmadığı için macOS ilk açılışta engeller:
+   - macOS 15 (Sequoia) ve sonrası: uyarıyı "Bitti" ile kapatın, Sistem Ayarları >
+     Gizlilik ve Güvenlik'e gidin, aşağıda "SONdpi ... engellendi" satırındaki
+     "Yine de Aç" düğmesine basın ve onaylayın.
+   - macOS 14 ve öncesi: SONdpi.app'e sağ tıklayın > Aç > Aç.
+   - Ya da Terminal'de bir kez:  xattr -dr com.apple.quarantine /Applications/SONdpi.app
+3. Menü çubuğunda maskot belirir (uyuyorsa kapalıdır). Açmak için bir kez tıklayın.
+   macOS yönetici şifresi isterse bu, proxy ayarını değiştirmek içindir.
+
+KULLANIM
+- Tık: aç / kapat.  Sağ tık (ya da Control + tık): menü.
+- Menüde: "Mac açılışında başlat", "Maskot simgesi" (kapatılırsa sade kalkan simgesi), "Çıkış".
+- Maskot: uyanık = açık, uyuyor = kapalı, endişeli = sorun var (menüde nedeni yazar).
+
+NE YAPAR
+- Açınca bilgisayarın kendi içinde (127.0.0.1) küçük bir proxy çalışır ve macOS'un
+  "otomatik proxy yapılandırması" ayarı ona yönlendirilir. Proxy her bağlantıda:
+  adı DoH ile (Cloudflare / Google, şifreli) çözer, kaybolan bağlantı denemesini başka
+  bir porttan yeniden dener ve sitenin adını taşıyan ilk paketi DPI'nın okuyamayacağı
+  biçimde ikiye böler.
+- Kapatınca (ya da Çıkış'ta) proxy ayarı eski hâline döner. Uygulama çökse bile
+  internet kesilmez: tarayıcılar proxy'ye ulaşamayınca doğrudan bağlanır.
+
+SINIRLAR
+- Yalnızca sistem proxy ayarına uyan uygulamalar kapsanır: Safari, Chrome, Edge, Firefox
+  (varsayılan ayarıyla), Discord masaüstü uygulaması gibi. Proxy ayarını yok sayan
+  uygulamalar ve UDP trafiği (ör. sesli görüşme) proxy'den geçmez.
+- Discord ve Roblox uygulamalarıyla deneme henüz yapılmadı; yalnızca tarayıcı ve komut
+  satırı istemcileriyle ölçüldü (Turkcell, Kasım 2026).
+
+KALDIRMA
+Menüden Çıkış, ardından SONdpi.app'i çöpe atın. İz kalmasın isterseniz şunları da silin:
+  ~/Library/Application Support/SONdpi
+  ~/Library/LaunchAgents/io.github.uruskan.sondpi.plist   ("Mac açılışında başlat" açıldıysa)

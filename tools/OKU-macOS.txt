@@ -13,11 +13,13 @@ KURULUM
      "Yine de Aç" düğmesine basın ve onaylayın.
    - macOS 14 ve öncesi: SONdpi.app'e sağ tıklayın > Aç > Aç.
    - Ya da Terminal'de bir kez:  xattr -dr com.apple.quarantine /Applications/SONdpi.app
-3. Menü çubuğunda maskot belirir (uyuyorsa kapalıdır). Tıklayın, açılan menüde "Açık"ı seçin.
+3. Menü çubuğunda maskot belirir (uyuyorsa kapalıdır). Tıklayın, maskotun altındaki anahtara
+   tıklayın (yeşil = açık, kırmızı = kapalı) ya da "Açık"ı seçin.
    macOS yönetici şifresi isterse bu, proxy ayarını değiştirmek içindir.
 
 KULLANIM
-- Menü Windows sürümündekiyle aynıdır, yalnızca sağ tık yerine sol tıkla açılır: maskot,
+- Menü Windows sürümündekiyle aynıdır, yalnızca sağ tık yerine sol tıkla açılır: maskot
+  ve altında tek tıkla çevrilen yeşil/kırmızı anahtar,
   "Açık" anahtarı, sayaçlar, "Mac açılışında başlat", "Maskot simgesi" (kapatılırsa sade kalkan simgesi),
   "SONdpi'yi kaldır…", "Çıkış".
 - Maskot: uyanık = açık, uyuyor = kapalı, endişeli = sorun var (menüde nedeni yazar).

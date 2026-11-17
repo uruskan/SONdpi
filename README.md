@@ -123,7 +123,7 @@ Sahte paket (TTL hilesi) yönetici hakkı ister; ölçtüğümüz hatta buna ger
 
 **Kurulum:** [Sürümler](https://github.com/uruskan/SONdpi/releases) sayfasından `SONdpi-…-macos-universal.zip`'i indir, aç, `SONdpi.app`'i Uygulamalar'a sürükle. Uygulama Apple'a kayıtlı bir sertifikayla imzalı olmadığı için ilk açılışta macOS engeller: macOS 15 ve sonrasında Sistem Ayarları > Gizlilik ve Güvenlik > "Yine de Aç"; daha eskilerde sağ tık > Aç. Apple Silicon ve Intel için tek paket (Intel'de denenmedi).
 
-**Kullanım:** menü çubuğundaki maskota tıkla; menü Windows'takiyle aynıdır, yalnızca sağ tık yerine sol tıkla açılır. "Açık" ile aç/kapat. macOS ilk seferde yönetici şifresi isteyebilir (proxy ayarı için).
+**Kullanım:** menü çubuğundaki maskota tıkla; menü Windows'takiyle aynıdır, yalnızca sağ tık yerine sol tıkla açılır. Maskotun altındaki anahtara tek tıkla aç/kapat (açıkken yeşil, kapalıyken kırmızı; menü açık kalır), ya da "Açık"ı seç. macOS ilk seferde yönetici şifresi isteyebilir (proxy ayarı için).
 
 **Kapatınca ya da Çıkış'ta** proxy ayarı eski hâline döner. Değiştirmeden önce özgün ayar bir dosyaya yazılır; uygulama çökerse bir sonraki açılışta düzeltilir, o arada da internet kesilmez (tarayıcılar proxy'ye ulaşamayınca doğrudan bağlanır; `kill -9` ile denendi).
 

@@ -1,7 +1,8 @@
 //! The menu-bar switch (`NSStatusItem`), the macOS counterpart of the Windows tray icon.
 //!
 //! The menu is the Windows tray menu, item for item: the mascot header (portrait, "SONdpi" in
-//! bold, the state line in green / grey / amber; only with the mascot on), "Açık", the three
+//! bold, the state line in green / grey / amber, and under it an on/off switch, green or red,
+//! that flips with one click (the user's wish, 2026-11-18); only with the mascot on), "Açık", the three
 //! counters, the error line when there is one, "Mac açılışında başlat", "Maskot simgesi",
 //! "SONdpi'yi kaldır…", "Çıkış". The one difference is the user's (2026-11-17): on macOS a left
 //! click opens the menu (on Windows a right click does). No Dock icon (`LSUIElement` and the
@@ -17,7 +18,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::io::Read;
 use std::os::fd::FromRawFd;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -53,7 +54,11 @@ const PORTRAIT_PT: f64 = 128.0;
 const TITLE_H: f64 = 17.0;
 const LINE_H: f64 = 16.0;
 const HEADER_W: f64 = PORTRAIT_PT + 40.0;
-const HEADER_H: f64 = 14.0 + PORTRAIT_PT + 6.0 + TITLE_H + 1.0 + LINE_H + 14.0;
+/// The switch under the state line: the size of a standard macOS switch, 8 below the line.
+const SWITCH_W: f64 = 38.0;
+const SWITCH_H: f64 = 22.0;
+const SWITCH_GAP: f64 = 8.0;
+const HEADER_H: f64 = 14.0 + PORTRAIT_PT + 6.0 + TITLE_H + 1.0 + LINE_H + SWITCH_GAP + SWITCH_H + 14.0;
 
 #[link(name = "Foundation", kind = "framework")]
 extern "C" {
@@ -132,6 +137,7 @@ struct Ui {
     header_sep: Id,
     portrait: Id,
     state: Id,
+    switch: Id,
     toggle: Id,
     error: Id,
     stats: [Id; 3],
@@ -150,6 +156,84 @@ static CORE: OnceLock<Arc<Core>> = OnceLock::new();
 
 fn core() -> Option<&'static Arc<Core>> {
     CORE.get()
+}
+
+// ---- the header switch ----------------------------------------------------------------------
+
+/// What the switch shows (one switch per process; read by its drawRect:).
+static SWITCH_ON: AtomicBool = AtomicBool::new(false);
+static SWITCH_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Track and knob of the switch, in its own coordinates: (track, knob).
+pub fn switch_geometry(on: bool) -> (NSRect, NSRect) {
+    let d = SWITCH_H - 4.0;
+    let x = if on { SWITCH_W - 2.0 - d } else { 2.0 };
+    (rect(0.0, 0.0, SWITCH_W, SWITCH_H), rect(x, 2.0, d, d))
+}
+
+extern "C" fn switch_draw(_this: Id, _cmd: Sel, _dirty: NSRect) {
+    let on = SWITCH_ON.load(Ordering::Relaxed);
+    let busy = SWITCH_BUSY.load(Ordering::Relaxed);
+    let (track, knob) = switch_geometry(on);
+    // SAFETY: called by AppKit inside the view's drawing context; every object used is a
+    // valid class or an autoreleased object living for this call.
+    unsafe {
+        let mut color: Id = send0(class("NSColor"), if on { "systemGreenColor" } else { "systemRedColor" });
+        if busy {
+            color = send1(color, "colorWithAlphaComponent:", 0.45f64);
+        }
+        send0::<()>(color, "setFill");
+        let path: Id = send3(class("NSBezierPath"), "bezierPathWithRoundedRect:xRadius:yRadius:", track, SWITCH_H / 2.0, SWITCH_H / 2.0);
+        send0::<()>(path, "fill");
+        let white: Id = send0(class("NSColor"), "whiteColor");
+        send0::<()>(white, "setFill");
+        let k: Id = send1(class("NSBezierPath"), "bezierPathWithOvalInRect:", knob);
+        send0::<()>(k, "fill");
+        let edge: Id = send2(class("NSColor"), "colorWithWhite:alpha:", 0.0f64, 0.15f64);
+        send0::<()>(edge, "setStroke");
+        send1::<f64, ()>(k, "setLineWidth:", 0.5f64);
+        send0::<()>(k, "stroke");
+    }
+}
+
+/// Claim the press so the release comes to this view.
+extern "C" fn switch_mouse_down(_this: Id, _cmd: Sel, _ev: Id) {}
+
+extern "C" fn switch_mouse_up(this: Id, _cmd: Sel, _ev: Id) {
+    if let Some(c) = core() {
+        let v = c.view();
+        if !v.busy {
+            c.set_enabled(!v.enabled);
+            SWITCH_ON.store(!v.enabled, Ordering::Relaxed);
+            SWITCH_BUSY.store(true, Ordering::Relaxed);
+        }
+    }
+    // SAFETY: `this` is the switch view receiving the event.
+    unsafe { send1::<bool, ()>(this, "setNeedsDisplay:", true) };
+    // The menu stays open; the timer redraws the rest as the change completes.
+    with_pool(|| refresh(true));
+}
+
+extern "C" fn switch_accepts_first_mouse(_this: Id, _cmd: Sel, _ev: Id) -> bool {
+    true
+}
+
+/// The switch view class (registered once).
+fn switch_class() -> Id {
+    static CLS: AtomicUsize = AtomicUsize::new(0);
+    let c = CLS.load(Ordering::Acquire);
+    if c != 0 {
+        return c as Id;
+    }
+    let methods: [(&str, *const c_void, &str); 4] = [
+        ("drawRect:", switch_draw as *const c_void, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}"),
+        ("mouseDown:", switch_mouse_down as *const c_void, "v@:@"),
+        ("mouseUp:", switch_mouse_up as *const c_void, "v@:@"),
+        ("acceptsFirstMouse:", switch_accepts_first_mouse as *const c_void, "B@:@"),
+    ];
+    let cls = make_class("SONdpiSwitch", "NSView", &methods);
+    CLS.store(cls as usize, Ordering::Release);
+    cls
 }
 
 // ---- Objective-C callbacks (main thread) ----------------------------------------------------
@@ -339,9 +423,9 @@ fn label(font: Id, frame: NSRect) -> Id {
     }
 }
 
-/// The header view: portrait, "SONdpi", state line, laid out like the Windows owner-drawn item.
-/// Returns (view, image view, state label).
-fn header_view() -> (Id, Id, Id) {
+/// The header view: portrait, "SONdpi", state line, laid out like the Windows owner-drawn item,
+/// and the switch under them. Returns (view, image view, state label, switch).
+fn header_view() -> (Id, Id, Id, Id) {
     // SAFETY: view construction on the main thread; subviews are retained by their superview,
     // the header view by its menu item (and by us via alloc/init).
     unsafe {
@@ -358,9 +442,14 @@ fn header_view() -> (Id, Id, Id) {
         send1::<Id, ()>(title, "setStringValue:", nsstring("SONdpi"));
         send1::<Id, ()>(title, "setTextColor:", send0::<Id>(class("NSColor"), "labelColor"));
         send1::<Id, ()>(v, "addSubview:", title);
-        let state = label(regular, rect(0.0, title_y - 1.0 - LINE_H, HEADER_W, LINE_H));
+        let line_y = title_y - 1.0 - LINE_H;
+        let state = label(regular, rect(0.0, line_y, HEADER_W, LINE_H));
         send1::<Id, ()>(v, "addSubview:", state);
-        (v, img, state)
+        let sw: Id = send1(send0::<Id>(switch_class(), "alloc"), "initWithFrame:", rect((HEADER_W - SWITCH_W) / 2.0, line_y - SWITCH_GAP - SWITCH_H, SWITCH_W, SWITCH_H));
+        send1::<usize, ()>(sw, "setAutoresizingMask:", NS_VIEW_MIN_X_MARGIN | NS_VIEW_MAX_X_MARGIN);
+        send1::<Id, ()>(sw, "setToolTip:", nsstring("Aç / kapat"));
+        send1::<Id, ()>(v, "addSubview:", sw);
+        (v, img, state, sw)
     }
 }
 
@@ -379,8 +468,10 @@ fn build(target: Id) -> Ui {
 
         // As tray::menu_entries.
         let header = menu_item(menu, target, "SONdpi", None);
-        let (hv, portrait, state) = header_view();
+        let (hv, portrait, state, switch) = header_view();
         send1::<Id, ()>(header, "setView:", hv);
+        // Enabled so the switch in its view gets the clicks (a view item has no action).
+        send1::<bool, ()>(header, "setEnabled:", true);
         let header_sep = separator(menu);
         let toggle = menu_item(menu, target, "Açık", Some("toggle:"));
         let stats = [
@@ -404,6 +495,7 @@ fn build(target: Id) -> Ui {
             header_sep,
             portrait,
             state,
+            switch,
             toggle,
             error,
             stats,
@@ -443,6 +535,9 @@ fn refresh(force: bool) {
             let (r, g, b) = state_line_color(l);
             let color: Id = send4(class("NSColor"), "colorWithSRGBRed:green:blue:alpha:", r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0, 1.0f64);
             send1::<Id, ()>(ui.state, "setTextColor:", color);
+            SWITCH_ON.store(v.enabled, Ordering::Relaxed);
+            SWITCH_BUSY.store(v.busy, Ordering::Relaxed);
+            send1::<bool, ()>(ui.switch, "setNeedsDisplay:", true);
 
             send1::<isize, ()>(ui.toggle, "setState:", v.enabled as isize);
             send1::<bool, ()>(ui.toggle, "setEnabled:", !v.busy);
@@ -614,5 +709,42 @@ mod tests {
         assert_eq!(state_line_color(Look::On), (36, 168, 96));
         assert_eq!(counter_lines(&v(true, true, false, None, 3))[0], "Korunan bağlantı: 3");
         assert_eq!(counter_lines(&v(false, false, false, None, 0))[2], "DNS yanıtı: –");
+    }
+
+    #[test]
+    fn switch_knob_sits_inside_the_track() {
+        for on in [false, true] {
+            let (t, k) = switch_geometry(on);
+            assert!(k.x >= t.x + 1.0 && k.x + k.w <= t.x + t.w - 1.0 && k.y >= 1.0 && k.y + k.h <= t.h - 1.0);
+        }
+        assert!(switch_geometry(true).1.x > switch_geometry(false).1.x);
+    }
+
+    /// Draws the header (both switch positions) to PNGs for a look by eye:
+    /// `SONDPI_HEADER_PNG=/tmp/h cargo test --lib header_png -- --ignored` writes /tmp/h-on.png
+    /// and /tmp/h-off.png.
+    #[test]
+    #[ignore]
+    fn header_png() {
+        let Ok(base) = std::env::var("SONDPI_HEADER_PNG") else { return };
+        with_pool(|| unsafe {
+            let (v, img, state, _) = header_view();
+            for (on, name) in [(true, "on"), (false, "off")] {
+                let l = if on { Look::On } else { Look::Off };
+                send1::<Id, ()>(img, "setImage:", image_png(PORTRAITS[l as usize], PORTRAIT_PT));
+                send1::<Id, ()>(state, "setStringValue:", nsstring(state_line(l)));
+                let (r, g, b) = state_line_color(l);
+                let color: Id = send4(class("NSColor"), "colorWithSRGBRed:green:blue:alpha:", r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0, 1.0f64);
+                send1::<Id, ()>(state, "setTextColor:", color);
+                SWITCH_ON.store(on, Ordering::Relaxed);
+                let bounds = rect(0.0, 0.0, HEADER_W, HEADER_H);
+                let rep: Id = send1(v, "bitmapImageRepForCachingDisplayInRect:", bounds);
+                send2::<NSRect, Id, ()>(v, "cacheDisplayInRect:toBitmapImageRep:", bounds, rep);
+                let dict: Id = send0(class("NSDictionary"), "dictionary");
+                let data: Id = send2(rep, "representationUsingType:properties:", 4usize, dict);
+                let ok: bool = send2(data, "writeToFile:atomically:", nsstring(&format!("{base}-{name}.png")), true);
+                assert!(ok);
+            }
+        });
     }
 }

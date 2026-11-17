@@ -1,7 +1,7 @@
 //! The menu-bar switch (`NSStatusItem`), the macOS counterpart of the Windows tray icon.
 //!
-//! Any click opens the menu, headed by the mascot's portrait with the name and the state, then
-//! the switch ("Açık"), the counters, "Mac açılışında başlat", "Maskot simgesi" and "Çıkış"
+//! Any click opens the menu, headed by the mascot's portrait with the name and the state
+//! (clicking it flips the switch, as on Windows), then the switch ("Açık"), the counters, "Mac açılışında başlat", "Maskot simgesi" and "Çıkış"
 //! (the user's choice, 2026-11-17: the switch lives in the menu, next to the mascot). No Dock icon (`LSUIElement` in the bundle and the
 //! accessory activation policy). The icon is the mascot's face (awake, asleep, worried) or,
 //! with the mascot off, a template shield symbol.
@@ -258,7 +258,8 @@ fn build(target: Id) -> Ui {
         let menu: Id = send1(menu, "initWithTitle:", nsstring("SONdpi"));
         send1::<bool, ()>(menu, "setAutoenablesItems:", false);
 
-        let header = menu_item(menu, target, "SONdpi", None);
+        // Clicking the mascot header flips the switch, as on Windows.
+        let header = menu_item(menu, target, "SONdpi", Some("toggle:"));
         separator(menu);
         let toggle = menu_item(menu, target, "Açık", Some("toggle:"));
         let error = menu_item(menu, target, "", None);
@@ -314,6 +315,7 @@ fn refresh(force: bool) {
             send1::<Id, ()>(ui.header, "setAttributedTitle:", header_title(state_line(&v)));
             send1::<isize, ()>(ui.toggle, "setState:", v.enabled as isize);
             send1::<bool, ()>(ui.toggle, "setEnabled:", !v.busy);
+            send1::<bool, ()>(ui.header, "setEnabled:", !v.busy);
             match &v.error {
                 Some(e) => {
                     send1::<Id, ()>(ui.error, "setTitle:", nsstring(e));

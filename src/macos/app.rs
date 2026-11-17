@@ -1,8 +1,8 @@
 //! The menu-bar switch (`NSStatusItem`), the macOS counterpart of the Windows tray icon.
 //!
-//! Click: switch on/off. Right click (or control-click): the menu, headed by the mascot's
-//! portrait with the name and the state, then the switch, the counters, "Mac açılışında
-//! başlat", "Maskot simgesi" and "Çıkış". No Dock icon (`LSUIElement` in the bundle and the
+//! Any click opens the menu, headed by the mascot's portrait with the name and the state, then
+//! the switch ("Açık"), the counters, "Mac açılışında başlat", "Maskot simgesi" and "Çıkış"
+//! (the user's choice, 2026-11-17: the switch lives in the menu, next to the mascot). No Dock icon (`LSUIElement` in the bundle and the
 //! accessory activation policy). The icon is the mascot's face (awake, asleep, worried) or,
 //! with the mascot off, a template shield symbol.
 //!
@@ -33,11 +33,6 @@ const SYMBOLS: [&str; 3] = ["shield.lefthalf.filled", "shield.slash", "exclamati
 
 const NS_ACTIVATION_POLICY_ACCESSORY: isize = 1;
 const NS_VARIABLE_STATUS_ITEM_LENGTH: f64 = -1.0;
-const NS_EVENT_MASK_LEFT_MOUSE_UP: u64 = 1 << 2;
-const NS_EVENT_MASK_RIGHT_MOUSE_UP: u64 = 1 << 4;
-const NS_EVENT_TYPE_RIGHT_MOUSE_DOWN: usize = 3;
-const NS_EVENT_TYPE_RIGHT_MOUSE_UP: usize = 4;
-const NS_EVENT_MODIFIER_FLAG_CONTROL: usize = 1 << 18;
 const STATUS_ICON_PT: f64 = 18.0;
 const PORTRAIT_PT: f64 = 56.0;
 
@@ -85,7 +80,7 @@ pub fn tooltip(v: &View) -> String {
     } else {
         "SONdpi: kapalı".to_string()
     };
-    format!("{line}\nTık: aç/kapat · Sağ tık: menü")
+    line
 }
 
 /// The state line under the mascot's name.
@@ -103,7 +98,6 @@ pub fn state_line(v: &View) -> &'static str {
 
 struct Ui {
     item: Id,
-    menu: Id,
     header: Id,
     toggle: Id,
     error: Id,
@@ -126,26 +120,6 @@ fn core() -> Option<&'static Arc<Core>> {
 }
 
 // ---- Objective-C callbacks (main thread) ----------------------------------------------------
-
-extern "C" fn on_click(_this: Id, _cmd: Sel, _sender: Id) {
-    with_pool(|| {
-        // SAFETY: NSApp and its current event are valid during an action callback.
-        let (ty, flags): (usize, usize) = unsafe {
-            let app: Id = send0(class("NSApplication"), "sharedApplication");
-            let ev: Id = send0(app, "currentEvent");
-            if ev.is_null() {
-                (0, 0)
-            } else {
-                (send0(ev, "type"), send0(ev, "modifierFlags"))
-            }
-        };
-        if ty == NS_EVENT_TYPE_RIGHT_MOUSE_UP || ty == NS_EVENT_TYPE_RIGHT_MOUSE_DOWN || flags & NS_EVENT_MODIFIER_FLAG_CONTROL != 0 {
-            show_menu();
-        } else {
-            toggle();
-        }
-    });
-}
 
 extern "C" fn on_toggle(_this: Id, _cmd: Sel, _sender: Id) {
     toggle();
@@ -193,21 +167,6 @@ fn toggle() {
         }
     }
     refresh(true);
-}
-
-fn show_menu() {
-    refresh(true);
-    // Copy the handles out: the menu runs a nested event loop in which the timer redraws, so
-    // `UI` must not stay borrowed across it.
-    let Some((item, menu)) = UI.with(|u| u.borrow().as_ref().map(|ui| (ui.item, ui.menu))) else { return };
-    // SAFETY: the status item and the menu are retained by `Ui`. Setting the menu and clicking
-    // makes AppKit open it under the icon; it is removed again so a plain click keeps toggling.
-    unsafe {
-        send1::<Id, ()>(item, "setMenu:", menu);
-        let button: Id = send0(item, "button");
-        send1::<Id, ()>(button, "performClick:", NIL);
-        send1::<Id, ()>(item, "setMenu:", NIL);
-    }
 }
 
 // ---- building and redrawing -----------------------------------------------------------------
@@ -294,10 +253,6 @@ fn build(target: Id) -> Ui {
         let bar: Id = send0(class("NSStatusBar"), "systemStatusBar");
         let item: Id = send1(bar, "statusItemWithLength:", NS_VARIABLE_STATUS_ITEM_LENGTH);
         let _: Id = send0(item, "retain");
-        let button: Id = send0(item, "button");
-        send1::<Id, ()>(button, "setTarget:", target);
-        send1::<Sel, ()>(button, "setAction:", sel("click:"));
-        let _: isize = send1(button, "sendActionOn:", NS_EVENT_MASK_LEFT_MOUSE_UP | NS_EVENT_MASK_RIGHT_MOUSE_UP);
 
         let menu: Id = send0(class("NSMenu"), "alloc");
         let menu: Id = send1(menu, "initWithTitle:", nsstring("SONdpi"));
@@ -318,10 +273,11 @@ fn build(target: Id) -> Ui {
         let mascot = menu_item(menu, target, "Maskot simgesi", Some("mascot:"));
         separator(menu);
         menu_item(menu, target, "Çıkış", Some("quit:"));
+        // Every click opens it.
+        send1::<Id, ()>(item, "setMenu:", menu);
 
         Ui {
             item,
-            menu,
             header,
             toggle,
             error,
@@ -451,8 +407,7 @@ pub fn run() -> i32 {
     let _ = CORE.set(c.clone());
     install_signals(c);
 
-    let methods: [(&str, *const c_void, &str); 7] = [
-        ("click:", on_click as *const c_void, "v@:@"),
+    let methods: [(&str, *const c_void, &str); 6] = [
         ("toggle:", on_toggle as *const c_void, "v@:@"),
         ("autostart:", on_autostart as *const c_void, "v@:@"),
         ("mascot:", on_mascot as *const c_void, "v@:@"),
@@ -507,7 +462,7 @@ mod tests {
         assert_eq!(look(&v(true, false, false, None, 0)), Look::Problem);
         assert_eq!(look(&v(true, false, true, None, 0)), Look::On); // switching on
         assert_eq!(look(&v(false, false, false, Some("x"), 0)), Look::Problem);
-        assert!(tooltip(&v(true, true, false, None, 0)).starts_with("SONdpi: açık, hazır\n"));
+        assert_eq!(tooltip(&v(true, true, false, None, 0)), "SONdpi: açık, hazır");
         assert!(tooltip(&v(true, true, false, None, 5)).starts_with("SONdpi: açık, 5 bağlantı korundu"));
         assert!(tooltip(&v(false, false, false, None, 0)).starts_with("SONdpi: kapalı"));
         assert!(tooltip(&v(false, false, false, Some("Açılamadı: x"), 0)).starts_with("SONdpi: sorun, Açılamadı: x"));

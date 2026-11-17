@@ -2,7 +2,7 @@ SONdpi (macOS)
 ==============
 
 Discord, Roblox ve benzeri engelli sitelere erişim için tek anahtarlı DPI atlatma aracı.
-Menü çubuğunda maskot olarak durur: tıkla aç, tıkla kapat.
+Menü çubuğunda maskot olarak durur; tıklayınca açılan menüden açılıp kapanır.
 
 KURULUM
 1. Zip'i açın, SONdpi.app'i Uygulamalar (Applications) klasörüne sürükleyin.
@@ -13,12 +13,11 @@ KURULUM
      "Yine de Aç" düğmesine basın ve onaylayın.
    - macOS 14 ve öncesi: SONdpi.app'e sağ tıklayın > Aç > Aç.
    - Ya da Terminal'de bir kez:  xattr -dr com.apple.quarantine /Applications/SONdpi.app
-3. Menü çubuğunda maskot belirir (uyuyorsa kapalıdır). Açmak için bir kez tıklayın.
+3. Menü çubuğunda maskot belirir (uyuyorsa kapalıdır). Tıklayın, menüde "Açık"ı seçin.
    macOS yönetici şifresi isterse bu, proxy ayarını değiştirmek içindir.
 
 KULLANIM
-- Tık: aç / kapat.  Sağ tık (ya da Control + tık): menü.
-- Menüde: "Mac açılışında başlat", "Maskot simgesi" (kapatılırsa sade kalkan simgesi), "Çıkış".
+- Maskota tıklayınca menü açılır: "Açık" anahtarı, sayaçlar, "Mac açılışında başlat", "Maskot simgesi" (kapatılırsa sade kalkan simgesi), "Çıkış".
 - Maskot: uyanık = açık, uyuyor = kapalı, endişeli = sorun var (menüde nedeni yazar).
 
 NE YAPAR

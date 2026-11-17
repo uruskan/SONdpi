@@ -7,8 +7,8 @@
 13 ICON "icons\\sorun-portre.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,1,1,0
-PRODUCTVERSION 0,1,1,0
+FILEVERSION 0,2,0,0
+PRODUCTVERSION 0,2,0,0
 FILEOS 0x40004L
 FILETYPE 0x1L
 BEGIN
@@ -18,8 +18,8 @@ BEGIN
     BEGIN
       VALUE "ProductName", "SONdpi"
       VALUE "FileDescription", "SONdpi"
-      VALUE "FileVersion", "0.1.1"
-      VALUE "ProductVersion", "0.1.1"
+      VALUE "FileVersion", "0.2.0"
+      VALUE "ProductVersion", "0.2.0"
       VALUE "OriginalFilename", "sondpi.exe"
       VALUE "LegalCopyright", "MIT"
     END

@@ -290,6 +290,8 @@ mod tests {
         // nothing listens there any more: refused, fast
         let t = Instant::now();
         assert!(connect(&[addr], &DialConfig::default()).is_err());
-        assert!(t.elapsed() < Duration::from_secs(2));
+        // Windows retries a refused loopback SYN for about 2 s before reporting it.
+        let limit = if cfg!(windows) { 5 } else { 2 };
+        assert!(t.elapsed() < Duration::from_secs(limit));
     }
 }

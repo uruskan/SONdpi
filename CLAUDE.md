@@ -43,7 +43,7 @@ Bunlar tahmin değil, bu hatta yapılan ölçümlerdir. Başka servis sağlayıc
 - Düz HTTP'de Host değerini bölmek RST alıyor; başlık adını `hoSt:` yazmak geçiyor.
 - Kayıp SYN: Cloudflare IPv4'e 120 doğrudan bağlantının 7'si 1 sn'yi aştı ya da kurulamadı; proxy'nin yarışan yeniden aramasıyla 0/120 (15'i kurtarıldı).
 - DoH: Quad9 443'te HTTP/1.1'e 505 veriyor; Mac listesi 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 (SecureTransport, IP sertifikası doğrulanıyor).
-- Uçtan uca: sistem proxy'si üzerinden URLSession (Safari'nin yığını) engelli adları açıyor; SIGTERM'de ayar geri yükleniyor; `kill -9` sonrası internet doğrudan sürüyor, yeniden açılışta toparlanıyor. `networksetup` bu yönetici hesabında şifresiz çalıştı.
+- Uçtan uca: sistem proxy'si üzerinden URLSession (Safari'nin yığını) engelli adları açıyor; SIGTERM'de ayar geri yükleniyor; `kill -9` sonrası internet doğrudan sürüyor, yeniden açılışta toparlanıyor. Anahtarı kullanıcı açtı; `networksetup`'ın şifre isteyip istemediği not edilmedi.
 - Akamai'nin bazı IPv6 uçları curl'ün varsayılan kullanıcı aracısına `/` için yanıt vermiyor (microsoft.com); proxy ile ilgisi yok.
 
 ## Mimari

@@ -19,7 +19,15 @@
 //! Nothing here panics on client or server input; anything not understood is relayed
 //! unchanged or refused.
 
-use std::net::IpAddr;
+use crate::dial::{self, DialConfig};
+use crate::resolve::Resolver;
+use crate::tls;
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Largest HTTP request head or SOCKS5 request accepted from a client.
 pub const MAX_HEAD: usize = 16 * 1024;
@@ -237,19 +245,30 @@ pub fn socks_reply(code: u8) -> [u8; 10] {
 /// Where to cut the first bytes a client sends through a tunnel, as two TCP writes:
 /// `Some((bytes, cut))` writes `bytes[..cut]`, then `bytes[cut..]`. A complete TLS
 /// ClientHello record is re-framed as two records ([`crate::tls::split_record`]) and cut
-/// between them; a plain HTTP request is cut in the middle of its Host value. `None`: send
+/// between them. A plain HTTP request gets its `Host:` header name written as `hoSt:` (header
+/// names are case-insensitive; measured: the DPI matches `Host:` exactly, and cutting the
+/// value alone draws its RST) and is cut in the middle of the Host value. `None`: send
 /// `first` unchanged.
 pub fn desync_first(first: &[u8]) -> Option<(Vec<u8>, usize)> {
-    if let Some(len) = crate::tls::handshake_record_len(first) {
+    if let Some(len) = tls::handshake_record_len(first) {
         let rec = first.get(..len)?;
-        let at = crate::tls::sni_cut(rec)?;
-        let mut out = crate::tls::split_record(rec, at)?;
+        let at = tls::sni_cut(rec)?;
+        let mut out = tls::split_record(rec, at)?;
         out.extend_from_slice(&first[len..]);
         return Some((out, 5 + at));
     }
     let host = crate::desync::parse_http_request(first)?.host?;
     let cut = (host.start + host.end) / 2;
-    (cut > host.start).then(|| (first.to_vec(), cut))
+    if cut <= host.start {
+        return None;
+    }
+    let mut out = first.to_vec();
+    // The header line starts after the CRLF before the value.
+    let line = first[..host.start].windows(2).rposition(|w| w == b"\r\n").map(|i| i + 2)?;
+    if out.get(line..line + 5).is_some_and(|n| n.eq_ignore_ascii_case(b"host:")) {
+        out[line..line + 4].copy_from_slice(b"hoSt");
+    }
+    Some((out, cut))
 }
 
 /// The PAC script: everything through the proxy at `127.0.0.1:port`, falling back to a
@@ -277,6 +296,433 @@ pub fn pac_script(port: u16) -> String {
 }}
 "#
     )
+}
+
+// =========================================================================================
+// Server
+// =========================================================================================
+
+/// Optional line logger (dev mode).
+pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyConfig {
+    /// Listening address; port 0 picks a free port.
+    pub listen: SocketAddr,
+    pub dial: DialConfig,
+    /// Split the first request of every connection (off only for measurements).
+    pub desync: bool,
+    /// Pause between the two parts of a split first request, in milliseconds (0 = none;
+    /// TCP_NODELAY already sends them as separate segments).
+    pub gap_ms: u64,
+    /// Connections served at once; more are closed right away.
+    pub max_conns: usize,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        ProxyConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            dial: DialConfig::default(),
+            desync: true,
+            gap_ms: 0,
+            max_conns: 4096,
+        }
+    }
+}
+
+/// Counters since the proxy started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProxyStats {
+    pub accepted: u64,
+    pub active: u64,
+    /// Connections whose first request was split.
+    pub desynced: u64,
+    /// Connections won by a re-dial or by the second address family.
+    pub rescued: u64,
+    /// Connections refused because the target could not be resolved or reached.
+    pub failed: u64,
+    /// Names resolved over DoH.
+    pub dns_answered: u64,
+    /// Lookups that fell back to the system resolver.
+    pub dns_fallbacks: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    accepted: AtomicU64,
+    active: AtomicU64,
+    desynced: AtomicU64,
+    rescued: AtomicU64,
+    failed: AtomicU64,
+}
+
+struct Shared {
+    cfg: ProxyConfig,
+    addr: SocketAddr,
+    resolver: Arc<Resolver>,
+    counters: Counters,
+    stop: AtomicBool,
+    log: Option<LogFn>,
+}
+
+impl Shared {
+    fn log(&self, f: impl FnOnce() -> String) {
+        if let Some(l) = &self.log {
+            l(&f());
+        }
+    }
+}
+
+/// A running proxy. Stopping (or dropping) it closes the listener; tunnels already open keep
+/// running until either side closes them.
+pub struct Proxy {
+    shared: Arc<Shared>,
+    accept: Option<JoinHandle<()>>,
+}
+
+/// Time a client gets to send its request head.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time the rest of a ClientHello record may take to arrive once it has started.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_BUF: usize = 64 * 1024;
+const CONN_STACK: usize = 256 * 1024;
+
+impl Proxy {
+    pub fn start(cfg: ProxyConfig, resolver: Arc<Resolver>, log: Option<LogFn>) -> io::Result<Proxy> {
+        let listener = TcpListener::bind(cfg.listen)?;
+        let addr = listener.local_addr()?;
+        let shared = Arc::new(Shared { cfg, addr, resolver, counters: Counters::default(), stop: AtomicBool::new(false), log });
+        let sh = shared.clone();
+        let accept = std::thread::Builder::new().name("sondpi-accept".into()).spawn(move || accept_loop(sh, listener))?;
+        Ok(Proxy { shared, accept: Some(accept) })
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.shared.addr
+    }
+
+    pub fn stats(&self) -> ProxyStats {
+        let c = &self.shared.counters;
+        ProxyStats {
+            accepted: c.accepted.load(Ordering::Relaxed),
+            active: c.active.load(Ordering::Relaxed),
+            desynced: c.desynced.load(Ordering::Relaxed),
+            rescued: c.rescued.load(Ordering::Relaxed),
+            failed: c.failed.load(Ordering::Relaxed),
+            dns_answered: self.shared.resolver.answered(),
+            dns_fallbacks: self.shared.resolver.fallbacks(),
+        }
+    }
+
+    /// True while the listener is accepting.
+    pub fn is_running(&self) -> bool {
+        self.accept.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        // Wake the blocking accept with a connection of our own.
+        let _ = TcpStream::connect_timeout(&self.shared.addr, Duration::from_millis(500));
+        if let Some(h) = self.accept.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        if self.accept.is_some() {
+            self.shutdown();
+        }
+    }
+}
+
+fn accept_loop(sh: Arc<Shared>, listener: TcpListener) {
+    loop {
+        let res = listener.accept();
+        if sh.stop.load(Ordering::Acquire) {
+            return;
+        }
+        let (client, _) = match res {
+            Ok(c) => c,
+            Err(e) => {
+                // Out of descriptors and the like: back off instead of spinning.
+                sh.log(|| format!("accept: {e}"));
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        sh.counters.accepted.fetch_add(1, Ordering::Relaxed);
+        if sh.counters.active.load(Ordering::Relaxed) >= sh.cfg.max_conns as u64 {
+            continue; // dropped: closed
+        }
+        sh.counters.active.fetch_add(1, Ordering::Relaxed);
+        let sh2 = sh.clone();
+        let spawned = std::thread::Builder::new().name("sondpi-conn".into()).stack_size(CONN_STACK).spawn(move || {
+            let _guard = ActiveGuard(&sh2);
+            serve(&sh2, client);
+        });
+        if spawned.is_err() {
+            sh.counters.active.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct ActiveGuard<'a>(&'a Shared);
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.counters.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Read once more into `buf`; `Ok(false)` at EOF.
+fn read_more(s: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<bool> {
+    let mut chunk = [0u8; 4096];
+    let n = s.read(&mut chunk)?;
+    buf.extend_from_slice(&chunk[..n]);
+    Ok(n > 0)
+}
+
+fn serve(sh: &Shared, mut client: TcpStream) {
+    let _ = client.set_nodelay(true);
+    let _ = client.set_read_timeout(Some(HEAD_TIMEOUT));
+    let mut buf = Vec::with_capacity(2048);
+    match read_more(&mut client, &mut buf) {
+        Ok(true) => {}
+        _ => return,
+    }
+    if buf[0] == 5 {
+        serve_socks(sh, client, buf);
+    } else {
+        serve_http(sh, client, buf);
+    }
+}
+
+fn serve_http(sh: &Shared, mut client: TcpStream, mut buf: Vec<u8>) {
+    let (ask, n) = loop {
+        match parse_http(&buf) {
+            Ok(Some(x)) => break x,
+            Ok(None) => match read_more(&mut client, &mut buf) {
+                Ok(true) => {}
+                _ => return,
+            },
+            Err(e) => {
+                sh.log(|| format!("http: {e}"));
+                let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                return;
+            }
+        }
+    };
+    let rest = buf.split_off(n);
+    match ask {
+        HttpAsk::Local { method, path } => {
+            let pac = pac_script(sh.addr.port());
+            let reply = if path == PAC_PATH && (method == "GET" || method == "HEAD") {
+                let body = if method == "GET" { pac.as_str() } else { "" };
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nContent-Length: {}\r\n\
+                     Cache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+                    pac.len()
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            };
+            let _ = client.write_all(reply.as_bytes());
+        }
+        HttpAsk::Tunnel(target) => {
+            let Some(up) = open(sh, &target) else {
+                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                return;
+            };
+            if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").is_err() {
+                return;
+            }
+            relay(sh, client, up, rest, &target);
+        }
+        HttpAsk::Forward { target, mut head } => {
+            let Some(up) = open(sh, &target) else {
+                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                return;
+            };
+            head.extend_from_slice(&rest);
+            relay(sh, client, up, head, &target);
+        }
+    }
+}
+
+fn serve_socks(sh: &Shared, mut client: TcpStream, mut buf: Vec<u8>) {
+    let (no_auth, n) = loop {
+        match parse_socks_greeting(&buf) {
+            Ok(Some(x)) => break x,
+            Ok(None) => match read_more(&mut client, &mut buf) {
+                Ok(true) => {}
+                _ => return,
+            },
+            Err(_) => return,
+        }
+    };
+    if !no_auth {
+        let _ = client.write_all(&[5, 0xff]);
+        return;
+    }
+    if client.write_all(&[5, 0]).is_err() {
+        return;
+    }
+    buf.drain(..n);
+    let (target, n) = loop {
+        if buf.len() > MAX_HEAD {
+            return;
+        }
+        match parse_socks_request(&buf) {
+            Ok(Some(x)) => break x,
+            Ok(None) => match read_more(&mut client, &mut buf) {
+                Ok(true) => {}
+                _ => return,
+            },
+            Err(code) => {
+                let _ = client.write_all(&socks_reply(code));
+                return;
+            }
+        }
+    };
+    let rest = buf.split_off(n);
+    let up = match open_err(sh, &target) {
+        Ok(up) => up,
+        Err(e) => {
+            let code = match e.kind() {
+                io::ErrorKind::ConnectionRefused => SOCKS_REFUSED,
+                io::ErrorKind::NotFound | io::ErrorKind::TimedOut | io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable => {
+                    SOCKS_HOST_UNREACHABLE
+                }
+                _ => SOCKS_FAILURE,
+            };
+            let _ = client.write_all(&socks_reply(code));
+            return;
+        }
+    };
+    if client.write_all(&socks_reply(SOCKS_OK)).is_err() {
+        return;
+    }
+    relay(sh, client, up, rest, &target);
+}
+
+fn open(sh: &Shared, target: &Target) -> Option<TcpStream> {
+    open_err(sh, target).ok()
+}
+
+/// Resolve and dial `target`.
+fn open_err(sh: &Shared, target: &Target) -> io::Result<TcpStream> {
+    let t0 = Instant::now();
+    let r = (|| {
+        let ips = match &target.host {
+            Host::Ip(ip) => vec![*ip],
+            Host::Name(n) => sh.resolver.lookup(n)?,
+        };
+        let addrs: Vec<SocketAddr> = ips.iter().map(|ip| SocketAddr::new(*ip, target.port)).collect();
+        if addrs.iter().any(|a| *a == sh.addr || (a.ip().is_unspecified() && a.port() == sh.addr.port())) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing to connect to the proxy itself"));
+        }
+        let t1 = t0.elapsed();
+        let d = dial::connect(&addrs, &sh.cfg.dial)?;
+        if d.rescued() {
+            sh.counters.rescued.fetch_add(1, Ordering::Relaxed);
+        }
+        sh.log(|| {
+            format!(
+                "{target} -> {} resolve {}ms connect {}ms attempt {}/{}",
+                d.stream.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
+                t1.as_millis(),
+                (t0.elapsed() - t1).as_millis(),
+                d.attempt + 1,
+                d.started
+            )
+        });
+        Ok(d.stream)
+    })();
+    match r {
+        Ok(s) => {
+            let _ = s.set_nodelay(true);
+            Ok(s)
+        }
+        Err(e) => {
+            sh.counters.failed.fetch_add(1, Ordering::Relaxed);
+            sh.log(|| format!("{target}: {e} after {}ms", t0.elapsed().as_millis()));
+            Err(e)
+        }
+    }
+}
+
+/// Send the client's first bytes (split when they are a ClientHello or HTTP request), then
+/// copy both ways until both directions are closed.
+fn relay(sh: &Shared, mut client: TcpStream, mut up: TcpStream, mut first: Vec<u8>, target: &Target) {
+    let _ = client.set_read_timeout(None);
+    let (Ok(c2), Ok(u2)) = (client.try_clone(), up.try_clone()) else { return };
+    let down = std::thread::Builder::new().name("sondpi-down".into()).stack_size(CONN_STACK).spawn(move || pump(u2, c2));
+    let Ok(down) = down else { return };
+
+    // The first request may already be here (absolute-form HTTP, data after CONNECT/SOCKS)
+    // or come now; a ClientHello can span reads.
+    let ok = (|| -> io::Result<()> {
+        if first.is_empty() && !read_more(&mut client, &mut first)? {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        if let Some(len) = tls::handshake_record_len(&first) {
+            let _ = client.set_read_timeout(Some(HELLO_TIMEOUT));
+            while first.len() < len && read_more(&mut client, &mut first).unwrap_or(false) {}
+            let _ = client.set_read_timeout(None);
+        }
+        match desync_first(&first).filter(|_| sh.cfg.desync) {
+            Some((bytes, cut)) => {
+                up.write_all(&bytes[..cut])?;
+                if sh.cfg.gap_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(sh.cfg.gap_ms));
+                }
+                up.write_all(&bytes[cut..])?;
+                sh.counters.desynced.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                up.write_all(&first)?;
+                sh.log(|| format!("{target}: first {} bytes sent unchanged", first.len()));
+            }
+        }
+        Ok(())
+    })()
+    .is_ok();
+    if ok {
+        pump(client, up);
+    } else {
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = up.shutdown(Shutdown::Both);
+    }
+    let _ = down.join();
+}
+
+/// Copy `from` -> `to` until EOF (then half-close `to`) or an error (then close both).
+fn pump(mut from: TcpStream, mut to: TcpStream) {
+    let mut buf = vec![0u8; RELAY_BUF];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => {
+                let _ = to.shutdown(Shutdown::Write);
+                return;
+            }
+            Ok(n) => {
+                if to.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let _ = from.shutdown(Shutdown::Both);
+    let _ = to.shutdown(Shutdown::Both);
 }
 
 #[cfg(test)]
@@ -393,8 +839,11 @@ mod tests {
 
         let req = b"GET / HTTP/1.1\r\nHost: discord.com\r\n\r\n";
         let (out, cut) = desync_first(req).unwrap();
-        assert_eq!(out, req.to_vec());
-        assert_eq!(&req[cut - 5..cut], b"disco");
+        assert_eq!(out, b"GET / HTTP/1.1\r\nhoSt: discord.com\r\n\r\n".to_vec());
+        assert_eq!(&out[cut - 5..cut], b"disco");
+        let req = b"POST /a HTTP/1.1\r\nAccept: */*\r\nHOST:  x.example\r\n\r\nbody";
+        let (out, _) = desync_first(req).unwrap();
+        assert_eq!(out, b"POST /a HTTP/1.1\r\nAccept: */*\r\nhoSt:  x.example\r\n\r\nbody".to_vec());
     }
 
     #[test]
@@ -402,5 +851,133 @@ mod tests {
         let p = pac_script(8642);
         assert!(p.contains("PROXY 127.0.0.1:8642; DIRECT"));
         assert!(p.starts_with("function FindProxyForURL(url, host) {"));
+    }
+
+    // ---- server ----------------------------------------------------------------------
+
+    fn test_proxy() -> Proxy {
+        let up: crate::dns::UpstreamFn = Arc::new(|_, _, _| Err("no DoH in tests".into()));
+        let res = Arc::new(Resolver::new(crate::dns::DnsConfig { upstreams: vec![], timeout_ms: 100 }, up));
+        Proxy::start(ProxyConfig::default(), res, None).unwrap()
+    }
+
+    /// One-shot upstream: reads until it has `want` bytes (0: a complete request head) or EOF,
+    /// replies `reply`, returns what it got.
+    fn upstream(want: usize, reply: &'static [u8]) -> (SocketAddr, JoinHandle<Vec<u8>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut got = Vec::new();
+            while if want == 0 { !got.windows(4).any(|w| w == b"\r\n\r\n") } else { got.len() < want } {
+                if !read_more(&mut s, &mut got).unwrap_or(false) {
+                    break;
+                }
+            }
+            s.write_all(reply).unwrap();
+            got
+        });
+        (addr, h)
+    }
+
+    fn read_all(s: &mut TcpStream) -> Vec<u8> {
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut v = Vec::new();
+        let _ = s.read_to_end(&mut v);
+        v
+    }
+
+    #[test]
+    fn connect_tunnel_splits_the_client_hello() {
+        let p = test_proxy();
+        let hello = crate::tls::build_client_hello("discord.com", 1);
+        let (up, h) = upstream(hello.len() + 5, b"server-hello");
+        let mut c = TcpStream::connect(p.addr()).unwrap();
+        c.write_all(format!("CONNECT {up} HTTP/1.1\r\nHost: {up}\r\n\r\n").as_bytes()).unwrap();
+        let mut resp = [0u8; 39];
+        c.read_exact(&mut resp).unwrap();
+        assert_eq!(&resp[..], b"HTTP/1.1 200 Connection established\r\n\r\n");
+        // the ClientHello arrives in two writes, as a browser might send it
+        c.write_all(&hello[..100]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        c.write_all(&hello[100..]).unwrap();
+        let got = h.join().unwrap();
+        let l1 = crate::tls::handshake_record_len(&got).unwrap();
+        let mut joined = got[5..l1].to_vec();
+        joined.extend_from_slice(&got[l1 + 5..]);
+        assert_eq!(joined, hello[5..].to_vec());
+        assert_eq!(read_all(&mut c), b"server-hello");
+        assert_eq!(p.stats().desynced, 1);
+        assert_eq!(p.stats().accepted, 1);
+    }
+
+    #[test]
+    fn socks5_with_a_local_name() {
+        let p = test_proxy();
+        let (up, h) = upstream(5, b"pong");
+        let mut c = TcpStream::connect(p.addr()).unwrap();
+        c.write_all(&[5, 1, 0]).unwrap();
+        let mut r = [0u8; 2];
+        c.read_exact(&mut r).unwrap();
+        assert_eq!(r, [5, 0]);
+        let mut req = vec![5, 1, 0, 3, 9];
+        req.extend_from_slice(b"localhost");
+        req.extend_from_slice(&up.port().to_be_bytes());
+        c.write_all(&req).unwrap();
+        let mut r = [0u8; 10];
+        c.read_exact(&mut r).unwrap();
+        assert_eq!(r[..2], [5, 0]);
+        c.write_all(b"ping!").unwrap();
+        assert_eq!(h.join().unwrap(), b"ping!");
+        assert_eq!(read_all(&mut c), b"pong");
+        assert_eq!(p.stats().desynced, 0);
+    }
+
+    #[test]
+    fn forward_absolute_form_request() {
+        let p = test_proxy();
+        let (up, h) = upstream(0, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+        let mut c = TcpStream::connect(p.addr()).unwrap();
+        c.write_all(format!("GET http://{up}/x HTTP/1.1\r\nHost: {up}\r\nProxy-Connection: keep-alive\r\n\r\n").as_bytes()).unwrap();
+        let resp = read_all(&mut c);
+        assert!(resp.ends_with(b"hi"));
+        let got = String::from_utf8(h.join().unwrap()).unwrap();
+        assert_eq!(got, format!("GET /x HTTP/1.1\r\nhoSt: {up}\r\nConnection: close\r\n\r\n"));
+        assert_eq!(p.stats().desynced, 1); // Host value cut
+    }
+
+    #[test]
+    fn serves_pac_and_refuses_bad_targets() {
+        let p = test_proxy();
+        let mut c = TcpStream::connect(p.addr()).unwrap();
+        c.write_all(b"GET /proxy.pac HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let resp = String::from_utf8(read_all(&mut c)).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains(&format!("PROXY 127.0.0.1:{}; DIRECT", p.addr().port())));
+
+        // nothing listens: 502
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let mut c = TcpStream::connect(p.addr()).unwrap();
+        c.write_all(format!("CONNECT {dead} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
+        assert!(read_all(&mut c).starts_with(b"HTTP/1.1 502"));
+        // a tunnel to the proxy itself: 502, no loop
+        let mut c = TcpStream::connect(p.addr()).unwrap();
+        c.write_all(format!("CONNECT {} HTTP/1.1\r\n\r\n", p.addr()).as_bytes()).unwrap();
+        assert!(read_all(&mut c).starts_with(b"HTTP/1.1 502"));
+        // garbage: 400
+        let mut c = TcpStream::connect(p.addr()).unwrap();
+        c.write_all(b"HELLO\r\n\r\n").unwrap();
+        assert!(read_all(&mut c).starts_with(b"HTTP/1.1 400"));
+        assert_eq!(p.stats().failed, 2);
+    }
+
+    #[test]
+    fn stop_closes_the_listener() {
+        let p = test_proxy();
+        let addr = p.addr();
+        assert!(p.is_running());
+        p.stop();
+        assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err());
     }
 }

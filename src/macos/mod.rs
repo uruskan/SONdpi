@@ -5,8 +5,13 @@
 //! Windows-only): libc and Security.framework in the modules that use them, the Objective-C
 //! runtime in `objc`.
 
+pub mod app;
+pub mod autostart;
+pub mod core;
 pub mod dev;
 pub mod doh;
+pub mod objc;
+pub mod sysproxy;
 
 use crate::dns::DnsConfig;
 use crate::resolve::Resolver;

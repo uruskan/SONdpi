@@ -33,10 +33,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("dev") => sondpi::macos::dev::run(&args[1..]),
-        _ => {
-            eprintln!("usage: sondpi dev [...]");
-            2
-        }
+        _ => sondpi::macos::app::run(),
     };
     std::process::exit(code);
 }

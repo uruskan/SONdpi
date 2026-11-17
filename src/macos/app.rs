@@ -196,21 +196,45 @@ extern "C" fn switch_draw(_this: Id, _cmd: Sel, _dirty: NSRect) {
     }
 }
 
-/// Claim the press so the release comes to this view.
-extern "C" fn switch_mouse_down(_this: Id, _cmd: Sel, _ev: Id) {}
+/// A press began on the switch (a release counts only after one).
+static SWITCH_PRESSED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn switch_mouse_up(this: Id, _cmd: Sel, _ev: Id) {
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSPoint {
+    x: f64,
+    y: f64,
+}
+
+/// Is the event's pointer inside the switch?
+fn event_inside(this: Id, ev: Id) -> bool {
+    // SAFETY: `ev` is the mouse event AppKit passed to `this`; NSPoint (two doubles) comes
+    // back in registers on arm64 and x86_64, so plain objc_msgSend is right.
+    let p: NSPoint = unsafe {
+        let w: NSPoint = send0(ev, "locationInWindow");
+        send2(this, "convertPoint:fromView:", w, NIL)
+    };
+    p.x >= 0.0 && p.y >= 0.0 && p.x <= SWITCH_W && p.y <= SWITCH_H
+}
+
+/// Claim the press so the release comes to this view.
+extern "C" fn switch_mouse_down(_this: Id, _cmd: Sel, _ev: Id) {
+    SWITCH_PRESSED.store(true, Ordering::Relaxed);
+}
+
+/// Flip on a click: pressed and released on the switch (dragging off cancels, as on a standard
+/// switch; a release without a press, as when the menu is opened by press-drag, does nothing).
+extern "C" fn switch_mouse_up(this: Id, _cmd: Sel, ev: Id) {
+    if !SWITCH_PRESSED.swap(false, Ordering::Relaxed) || !event_inside(this, ev) {
+        return;
+    }
     if let Some(c) = core() {
         let v = c.view();
         if !v.busy {
             c.set_enabled(!v.enabled);
-            SWITCH_ON.store(!v.enabled, Ordering::Relaxed);
-            SWITCH_BUSY.store(true, Ordering::Relaxed);
         }
     }
-    // SAFETY: `this` is the switch view receiving the event.
-    unsafe { send1::<bool, ()>(this, "setNeedsDisplay:", true) };
-    // The menu stays open; the timer redraws the rest as the change completes.
+    // The menu stays open; refresh redraws the switch now and the timer as the change completes.
     with_pool(|| refresh(true));
 }
 
@@ -231,7 +255,11 @@ fn switch_class() -> Id {
         ("mouseUp:", switch_mouse_up as *const c_void, "v@:@"),
         ("acceptsFirstMouse:", switch_accepts_first_mouse as *const c_void, "B@:@"),
     ];
-    let cls = make_class("SONdpiSwitch", "NSView", &methods);
+    let mut cls = make_class("SONdpiSwitch", "NSView", &methods);
+    if cls.is_null() {
+        // Already registered in this process.
+        cls = class("SONdpiSwitch");
+    }
     CLS.store(cls as usize, Ordering::Release);
     cls
 }

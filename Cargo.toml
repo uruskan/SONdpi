@@ -1,6 +1,6 @@
 [package]
 name = "sondpi"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Tek tıkla DPI atlatma: TLS/HTTP desync, yanıtsız bağlantıyı yeniden deneme, temiz DNS"
 license = "MIT"
@@ -14,9 +14,10 @@ path = "src/lib.rs"
 name = "sondpi"
 path = "src/main.rs"
 
-# Tek bağımlılık: Microsoft'un Windows API bildirimleri. Yeni crate ekleme; yalnızca
-# aşağıdaki özellik listesine satır eklenebilir.
-[dependencies.windows-sys]
+# Tek bağımlılık: Microsoft'un Windows API bildirimleri, yalnızca Windows'ta. Yeni crate ekleme;
+# yalnızca aşağıdaki özellik listesine satır eklenebilir. macOS'un sistem çağrıları (libc,
+# Security, AppKit) kaynakta elle bildirilir.
+[target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"
 features = [
   "Win32_Foundation",

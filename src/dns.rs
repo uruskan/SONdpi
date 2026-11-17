@@ -582,6 +582,9 @@ pub struct DnsResponder<C: Send + 'static> {
 }
 
 impl<C: Send + 'static> DnsResponder<C> {
+    /// Responder with the WinHTTP DoH transport (Windows only; elsewhere use
+    /// [`with_parts`](Self::with_parts)).
+    #[cfg(windows)]
     pub fn new(cfg: DnsConfig, on_done: Box<dyn Fn(DnsOutcome, C) + Send + Sync>) -> Self {
         let t0 = Instant::now();
         let clock: ClockFn = Arc::new(move || t0.elapsed().as_millis() as u64);

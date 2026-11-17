@@ -127,18 +127,21 @@ fn current(svc: &str) -> io::Result<AutoProxy> {
 }
 
 /// Run networksetup commands; if any is refused, run the refused ones again in one batch
-/// behind the administrator dialog.
-fn run_all(cmds: &[Vec<String>]) -> io::Result<()> {
+/// behind the administrator dialog (only when `interactive`; the watcher never prompts).
+fn run_all(cmds: &[Vec<String>], interactive: bool) -> io::Result<()> {
     let mut refused = Vec::new();
+    let mut first_err = None;
     for c in cmds {
-        if networksetup(c).is_err() {
+        if let Err(e) = networksetup(c) {
             refused.push(c.clone());
+            first_err.get_or_insert(e);
         }
     }
-    if refused.is_empty() {
-        return Ok(());
+    match first_err {
+        None => Ok(()),
+        Some(e) if !interactive => Err(e),
+        Some(_) => run_as_admin(&refused),
     }
-    run_as_admin(&refused)
 }
 
 /// Single-quote for /bin/sh.
@@ -182,8 +185,10 @@ fn write_atomic(path: &Path, data: &str) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Point every enabled service at `pac_url`, saving the originals in `dir` first.
-pub fn apply(dir: &Path, pac_url: &str) -> io::Result<()> {
+/// Point every enabled service at `pac_url`, saving the originals in `dir` first. The result
+/// is read back: networksetup does not always report a refusal, so a setting that did not
+/// take is retried once behind the administrator dialog (when `interactive`).
+pub fn apply(dir: &Path, pac_url: &str, interactive: bool) -> io::Result<()> {
     let path = saved_path(dir);
     let mut saved = std::fs::read_to_string(&path).map(|t| decode_saved(&t)).unwrap_or_default();
     let svcs = services()?;
@@ -200,7 +205,17 @@ pub fn apply(dir: &Path, pac_url: &str) -> io::Result<()> {
         cmds.push(vec![s("-setautoproxyurl"), svc.clone(), pac_url.to_string()]);
     }
     write_atomic(&path, &encode_saved(&saved))?;
-    run_all(&cmds)
+    run_all(&cmds, interactive)?;
+    if is_applied(pac_url)? {
+        return Ok(());
+    }
+    if interactive {
+        run_as_admin(&cmds)?;
+        if is_applied(pac_url)? {
+            return Ok(());
+        }
+    }
+    Err(io::Error::other("proxy ayarı uygulanamadı (macOS değişikliği kabul etmedi)"))
 }
 
 /// True when every enabled service points at `pac_url` and has it switched on.
@@ -225,7 +240,7 @@ pub fn restore(dir: &Path) -> io::Result<()> {
     // Services that disappeared meanwhile cannot be set; skip them.
     let present = services()?;
     let saved: BTreeMap<String, AutoProxy> = saved.into_iter().filter(|(k, _)| present.contains(k)).collect();
-    run_all(&restore_commands(&saved))?;
+    run_all(&restore_commands(&saved), true)?;
     std::fs::remove_file(&path).or_else(|e| if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
 }
 

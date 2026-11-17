@@ -82,7 +82,7 @@ pub fn look(v: &View) -> Look {
 /// `tray::tooltip`.
 pub fn tooltip(v: &View) -> String {
     if v.busy {
-        "SONdpi: bağlanılıyor…".to_string()
+        "SONdpi: değiştiriliyor…".to_string()
     } else if let Some(e) = &v.error {
         format!("SONdpi: sorun, {e}")
     } else if v.enabled && !v.active {
@@ -167,7 +167,7 @@ extern "C" fn on_toggle(_this: Id, _cmd: Sel, _sender: Id) {
 extern "C" fn on_autostart(_this: Id, _cmd: Sel, _sender: Id) {
     let on = !super::autostart::is_enabled();
     if let Err(e) = super::autostart::set_enabled(on) {
-        eprintln!("SONdpi: başlangıç ayarı değiştirilemedi: {e}");
+        with_pool(|| info("Başlangıç ayarı değiştirilemedi", &e.to_string()));
     }
     with_pool(|| refresh(true));
 }
@@ -182,6 +182,11 @@ extern "C" fn on_mascot(_this: Id, _cmd: Sel, _sender: Id) {
 
 extern "C" fn on_uninstall(_this: Id, _cmd: Sel, _sender: Id) {
     with_pool(|| {
+        let exe = std::env::current_exe().ok();
+        if exe.as_deref().is_some_and(super::autostart::is_translocated) {
+            info("SONdpi kaldırılamıyor", "Uygulama indirildiği yerden geçici bir kopya olarak çalışıyor. Çıkış yapıp SONdpi.app'i çöpe atmanız yeterli.");
+            return;
+        }
         if !confirm(
             "SONdpi bu Mac'ten kaldırılsın mı?",
             "Proxy ayarı eski hâline döner, ayarlar silinir ve uygulama Çöp Sepeti'ne taşınır.",
@@ -227,6 +232,20 @@ extern "C" fn menu_will_open(_this: Id, _cmd: Sel, _menu: Id) {
 extern "C" fn will_terminate(_this: Id, _cmd: Sel, _note: Id) {
     if let Some(c) = core() {
         c.shutdown(Duration::from_secs(15));
+    }
+}
+
+/// A modal alert with one button.
+fn info(message: &str, text: &str) {
+    // SAFETY: as in `confirm`.
+    unsafe {
+        let app: Id = send0(class("NSApplication"), "sharedApplication");
+        send1::<bool, ()>(app, "activateIgnoringOtherApps:", true);
+        let a: Id = send0(send0::<Id>(class("NSAlert"), "alloc"), "init");
+        send1::<Id, ()>(a, "setMessageText:", nsstring(message));
+        send1::<Id, ()>(a, "setInformativeText:", nsstring(text));
+        let _: isize = send0(a, "runModal");
+        let _: () = send0(a, "release");
     }
 }
 
@@ -511,6 +530,15 @@ fn single_instance(dir: &std::path::Path) -> bool {
 pub fn run() -> i32 {
     let dir = core::support_dir();
     if !single_instance(&dir) {
+        // Say so: the icon may be hidden behind the notch or other menu-bar items.
+        with_pool(|| {
+            // SAFETY: shared application before showing an alert from a fresh process.
+            unsafe {
+                let app: Id = send0(class("NSApplication"), "sharedApplication");
+                let _: bool = send1(app, "setActivationPolicy:", NS_ACTIVATION_POLICY_ACCESSORY);
+            }
+            info("SONdpi zaten çalışıyor", "Menü çubuğundaki maskota tıklayın. Görünmüyorsa menü çubuğu dolu ya da çentiğin arkasında kalmış olabilir.");
+        });
         return 0;
     }
     let c = Core::start(dir, super::new_resolver());

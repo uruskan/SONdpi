@@ -66,6 +66,7 @@ pub fn sel(name: &str) -> Sel {
 pub unsafe fn send0<R>(obj: Id, s: &str) -> R {
     // SAFETY: the caller guarantees the method signature this cast assumes.
     let f: unsafe extern "C" fn(Id, Sel) -> R = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: `f` is objc_msgSend with the signature the caller vouched for.
     unsafe { f(obj, sel(s)) }
 }
 
@@ -76,6 +77,7 @@ pub unsafe fn send0<R>(obj: Id, s: &str) -> R {
 pub unsafe fn send1<A, R>(obj: Id, s: &str, a: A) -> R {
     // SAFETY: the caller guarantees the method signature this cast assumes.
     let f: unsafe extern "C" fn(Id, Sel, A) -> R = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: `f` is objc_msgSend with the signature the caller vouched for.
     unsafe { f(obj, sel(s), a) }
 }
 
@@ -86,6 +88,7 @@ pub unsafe fn send1<A, R>(obj: Id, s: &str, a: A) -> R {
 pub unsafe fn send2<A, B, R>(obj: Id, s: &str, a: A, b: B) -> R {
     // SAFETY: the caller guarantees the method signature this cast assumes.
     let f: unsafe extern "C" fn(Id, Sel, A, B) -> R = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: `f` is objc_msgSend with the signature the caller vouched for.
     unsafe { f(obj, sel(s), a, b) }
 }
 
@@ -96,6 +99,7 @@ pub unsafe fn send2<A, B, R>(obj: Id, s: &str, a: A, b: B) -> R {
 pub unsafe fn send3<A, B, C, R>(obj: Id, s: &str, a: A, b: B, c: C) -> R {
     // SAFETY: the caller guarantees the method signature this cast assumes.
     let f: unsafe extern "C" fn(Id, Sel, A, B, C) -> R = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: `f` is objc_msgSend with the signature the caller vouched for.
     unsafe { f(obj, sel(s), a, b, c) }
 }
 
@@ -106,6 +110,7 @@ pub unsafe fn send3<A, B, C, R>(obj: Id, s: &str, a: A, b: B, c: C) -> R {
 pub unsafe fn send4<A, B, C, D, R>(obj: Id, s: &str, a: A, b: B, c: C, d: D) -> R {
     // SAFETY: the caller guarantees the method signature this cast assumes.
     let f: unsafe extern "C" fn(Id, Sel, A, B, C, D) -> R = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: `f` is objc_msgSend with the signature the caller vouched for.
     unsafe { f(obj, sel(s), a, b, c, d) }
 }
 
@@ -116,6 +121,7 @@ pub unsafe fn send4<A, B, C, D, R>(obj: Id, s: &str, a: A, b: B, c: C, d: D) -> 
 pub unsafe fn send5<A, B, C, D, E, R>(obj: Id, s: &str, a: A, b: B, c: C, d: D, e: E) -> R {
     // SAFETY: the caller guarantees the method signature this cast assumes.
     let f: unsafe extern "C" fn(Id, Sel, A, B, C, D, E) -> R = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    // SAFETY: `f` is objc_msgSend with the signature the caller vouched for.
     unsafe { f(obj, sel(s), a, b, c, d, e) }
 }
 

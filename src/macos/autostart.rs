@@ -44,10 +44,19 @@ pub fn plist(exe: &Path) -> String {
     )
 }
 
+/// True when macOS runs the app from a temporary, randomised copy (App Translocation: an
+/// unnotarized app opened from where it was downloaded or unzipped).
+pub fn is_translocated(exe: &Path) -> bool {
+    exe.to_string_lossy().contains("/AppTranslocation/")
+}
+
 pub fn set_enabled(on: bool) -> io::Result<()> {
     let path = plist_path();
     if on {
         let exe = std::env::current_exe()?;
+        if is_translocated(&exe) {
+            return Err(io::Error::other("SONdpi.app önce Uygulamalar klasörüne taşınmalı"));
+        }
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }
@@ -68,6 +77,8 @@ mod tests {
     fn bundle_detection() {
         assert_eq!(bundle_of(Path::new("/Applications/SONdpi.app/Contents/MacOS/sondpi")), Some(PathBuf::from("/Applications/SONdpi.app")));
         assert_eq!(bundle_of(Path::new("/x/target/release/sondpi")), None);
+        assert!(is_translocated(Path::new("/private/var/folders/x/T/AppTranslocation/ABC/d/SONdpi.app/Contents/MacOS/sondpi")));
+        assert!(!is_translocated(Path::new("/Applications/SONdpi.app/Contents/MacOS/sondpi")));
     }
 
     #[test]

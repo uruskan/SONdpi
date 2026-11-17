@@ -14,10 +14,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often the worker checks the proxy and the system setting while the switch is on.
 const WATCH_EVERY: Duration = Duration::from_secs(10);
+/// Least time between two repairs of the system setting by the watcher. A primary service
+/// that never shows our PAC (a VPN with its own proxy settings) must not cause a networksetup
+/// storm.
+const REPAIR_EVERY: Duration = Duration::from_secs(300);
 
 /// What the menu shows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -122,6 +126,7 @@ struct State {
     settings: Settings,
     applied: bool,
     busy: bool,
+    last_repair: Option<Instant>,
     error: Option<String>,
 }
 
@@ -145,7 +150,7 @@ impl Core {
         let core = Arc::new(Core {
             dir,
             resolver,
-            state: Mutex::new(State { proxy: None, settings, applied: false, busy: true, error: None }),
+            state: Mutex::new(State { proxy: None, settings, applied: false, busy: true, last_repair: None, error: None }),
             tx: Mutex::new(tx),
         });
         let c = core.clone();
@@ -263,7 +268,7 @@ impl Core {
     /// Start the proxy and apply the system setting. On failure a user's flip is undone (the
     /// switch goes back to off and says why); a repair by the watcher only reports.
     fn go_on(&self, revert_on_failure: bool) {
-        let r = self.ensure_proxy().and_then(|port| sysproxy::apply(&self.dir, &Self::pac_url(port)));
+        let r = self.ensure_proxy().and_then(|port| sysproxy::apply(&self.dir, &Self::pac_url(port), revert_on_failure));
         let mut st = lock(&self.state);
         match r {
             Ok(()) => {
@@ -282,7 +287,9 @@ impl Core {
                 let p = st.proxy.take();
                 drop(st);
                 drop(p);
-                let _ = sysproxy::restore(&self.dir);
+                if let Err(re) = sysproxy::restore(&self.dir) {
+                    lock(&self.state).error = Some(format!("Açılamadı: {e}; eski proxy ayarı da geri yüklenemedi: {re}"));
+                }
             }
         }
     }
@@ -308,8 +315,14 @@ impl Core {
             return;
         }
         let ok = port.is_some_and(|p| primary_has_pac(&Self::pac_url(p)));
-        if !ok {
-            lock(&self.state).busy = true;
+        let due = lock(&self.state).last_repair.is_none_or(|t| t.elapsed() >= REPAIR_EVERY);
+        if !ok && (due || port.is_none()) {
+            {
+                let mut st = lock(&self.state);
+                st.busy = true;
+                st.last_repair = Some(Instant::now());
+            }
+            // Without prompting: a repair never shows the administrator dialog.
             self.go_on(false);
             lock(&self.state).busy = false;
         }

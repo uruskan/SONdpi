@@ -30,6 +30,8 @@ pub struct View {
     pub busy: bool,
     pub error: Option<String>,
     pub stats: ProxyStats,
+    /// The proxy exists, so the counters mean something.
+    pub has_stats: bool,
     pub mascot: bool,
     pub autostart: bool,
 }
@@ -160,6 +162,7 @@ impl Core {
             busy: st.busy,
             error: st.error.clone(),
             stats: st.proxy.as_ref().map(|p| p.stats()).unwrap_or_default(),
+            has_stats: st.proxy.is_some(),
             mascot: st.settings.mascot,
             autostart: super::autostart::is_enabled(),
         }

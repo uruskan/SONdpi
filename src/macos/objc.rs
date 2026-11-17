@@ -29,6 +29,15 @@ extern "C" {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub struct NSRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct NSSize {
     pub width: f64,
     pub height: f64,
@@ -88,6 +97,16 @@ pub unsafe fn send3<A, B, C, R>(obj: Id, s: &str, a: A, b: B, c: C) -> R {
     // SAFETY: the caller guarantees the method signature this cast assumes.
     let f: unsafe extern "C" fn(Id, Sel, A, B, C) -> R = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
     unsafe { f(obj, sel(s), a, b, c) }
+}
+
+/// `[obj sel:a b:b c:c d:d]`.
+///
+/// # Safety
+/// As [`send0`], for signature `R (A, B, C, D)`.
+pub unsafe fn send4<A, B, C, D, R>(obj: Id, s: &str, a: A, b: B, c: C, d: D) -> R {
+    // SAFETY: the caller guarantees the method signature this cast assumes.
+    let f: unsafe extern "C" fn(Id, Sel, A, B, C, D) -> R = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel(s), a, b, c, d) }
 }
 
 /// `[obj sel:a b:b c:c d:d e:e]`.

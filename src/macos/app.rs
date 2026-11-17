@@ -1,13 +1,15 @@
 //! The menu-bar switch (`NSStatusItem`), the macOS counterpart of the Windows tray icon.
 //!
-//! Any click opens the menu, headed by the mascot's portrait with the name and the state
-//! (clicking it flips the switch, as on Windows), then the switch ("Açık"), the counters, "Mac açılışında başlat", "Maskot simgesi" and "Çıkış"
-//! (the user's choice, 2026-11-17: the switch lives in the menu, next to the mascot). No Dock icon (`LSUIElement` in the bundle and the
+//! The menu is the Windows tray menu, item for item: the mascot header (portrait, "SONdpi" in
+//! bold, the state line in green / grey / amber; only with the mascot on), "Açık", the three
+//! counters, the error line when there is one, "Mac açılışında başlat", "Maskot simgesi",
+//! "SONdpi'yi kaldır…", "Çıkış". The one difference is the user's (2026-11-17): on macOS a left
+//! click opens the menu (on Windows a right click does). No Dock icon (`LSUIElement` and the
 //! accessory activation policy). The icon is the mascot's face (awake, asleep, worried) or,
 //! with the mascot off, a template shield symbol.
 //!
-//! All AppKit calls happen on the main thread: the click and menu actions, a 0.5 s timer that
-//! redraws from [`Core::view`], and the termination callback. Slow work runs in [`Core`].
+//! All AppKit calls happen on the main thread: the menu actions, a 0.5 s timer that redraws
+//! from [`Core::view`], and the termination callback. Slow work runs in [`Core`].
 
 use super::core::{self, Core, View};
 use super::objc::*;
@@ -33,16 +35,29 @@ const SYMBOLS: [&str; 3] = ["shield.lefthalf.filled", "shield.slash", "exclamati
 
 const NS_ACTIVATION_POLICY_ACCESSORY: isize = 1;
 const NS_VARIABLE_STATUS_ITEM_LENGTH: f64 = -1.0;
+const NS_VIEW_WIDTH_SIZABLE: usize = 2;
+const NS_VIEW_MIN_X_MARGIN: usize = 1;
+const NS_VIEW_MAX_X_MARGIN: usize = 4;
+const NS_ALERT_FIRST_BUTTON: isize = 1000;
+/// NSTextAlignmentCenter: 1 where AppKit uses the iOS values (Apple silicon), 2 on Intel.
+#[cfg(target_arch = "x86_64")]
+const NS_TEXT_ALIGNMENT_CENTER: isize = 2;
+#[cfg(not(target_arch = "x86_64"))]
+const NS_TEXT_ALIGNMENT_CENTER: isize = 1;
 const STATUS_ICON_PT: f64 = 18.0;
-const PORTRAIT_PT: f64 = 56.0;
+
+/// Header layout, in points, as `tray::header_metrics` at 100 %: the portrait is 128 wide,
+/// 14 from the top; the name 6 below it, the state line 1 below the name, 14 below that; the
+/// item is 40 wider than the portrait.
+const PORTRAIT_PT: f64 = 128.0;
+const TITLE_H: f64 = 17.0;
+const LINE_H: f64 = 16.0;
+const HEADER_W: f64 = PORTRAIT_PT + 40.0;
+const HEADER_H: f64 = 14.0 + PORTRAIT_PT + 6.0 + TITLE_H + 1.0 + LINE_H + 14.0;
 
 #[link(name = "Foundation", kind = "framework")]
 extern "C" {
     static NSRunLoopCommonModes: Id;
-}
-#[link(name = "AppKit", kind = "framework")]
-extern "C" {
-    static NSFontAttributeName: Id;
 }
 
 /// Icon state, also the index into the image arrays.
@@ -53,6 +68,7 @@ pub enum Look {
     Problem = 2,
 }
 
+/// `tray::icon_state`.
 pub fn look(v: &View) -> Look {
     if v.error.is_some() || (v.enabled && !v.active && !v.busy) {
         Look::Problem
@@ -63,42 +79,59 @@ pub fn look(v: &View) -> Look {
     }
 }
 
-/// Tooltip text (same wording as the Windows tray).
+/// `tray::tooltip`.
 pub fn tooltip(v: &View) -> String {
-    let line = if v.busy {
-        "SONdpi: değiştiriliyor…".to_string()
+    if v.busy {
+        "SONdpi: bağlanılıyor…".to_string()
     } else if let Some(e) = &v.error {
         format!("SONdpi: sorun, {e}")
-    } else if v.enabled && v.active {
-        if v.stats.desynced == 0 {
+    } else if v.enabled && !v.active {
+        "SONdpi: açık ama motor çalışmıyor".to_string()
+    } else if v.enabled {
+        if v.stats.desynced == 0 && v.stats.rescued == 0 {
             "SONdpi: açık, hazır".to_string()
         } else {
             format!("SONdpi: açık, {} bağlantı korundu", v.stats.desynced)
         }
-    } else if v.enabled {
-        "SONdpi: açık ama motor çalışmıyor".to_string()
     } else {
         "SONdpi: kapalı".to_string()
-    };
-    line
+    }
 }
 
-/// The state line under the mascot's name.
-pub fn state_line(v: &View) -> &'static str {
-    if v.busy {
-        "Değiştiriliyor…"
-    } else {
-        match look(v) {
-            Look::On => "Açık",
-            Look::Off => "Kapalı",
-            Look::Problem => "Sorun var",
-        }
+/// `tray::state_line`.
+pub fn state_line(l: Look) -> &'static str {
+    match l {
+        Look::On => "Açık",
+        Look::Off => "Kapalı",
+        Look::Problem => "Sorun var",
     }
+}
+
+/// `tray::state_line_color`: green, grey, amber.
+pub fn state_line_color(l: Look) -> (u8, u8, u8) {
+    match l {
+        Look::On => (36, 168, 96),
+        Look::Off => (128, 135, 148),
+        Look::Problem => (224, 150, 0),
+    }
+}
+
+/// `tray::menu_model` lines: the counters while there are any, a dash otherwise.
+pub fn counter_lines(v: &View) -> [String; 3] {
+    let f = |label: &str, n: u64| if v.has_stats { format!("{label}: {n}") } else { format!("{label}: –") };
+    [
+        f("Korunan bağlantı", v.stats.desynced),
+        f("Kurtarılan bağlantı", v.stats.rescued),
+        f("DNS yanıtı", v.stats.dns_answered),
+    ]
 }
 
 struct Ui {
     item: Id,
     header: Id,
+    header_sep: Id,
+    portrait: Id,
+    state: Id,
     toggle: Id,
     error: Id,
     stats: [Id; 3],
@@ -122,7 +155,13 @@ fn core() -> Option<&'static Arc<Core>> {
 // ---- Objective-C callbacks (main thread) ----------------------------------------------------
 
 extern "C" fn on_toggle(_this: Id, _cmd: Sel, _sender: Id) {
-    toggle();
+    if let Some(c) = core() {
+        let v = c.view();
+        if !v.busy {
+            c.set_enabled(!v.enabled);
+        }
+    }
+    with_pool(|| refresh(true));
 }
 
 extern "C" fn on_autostart(_this: Id, _cmd: Sel, _sender: Id) {
@@ -130,7 +169,7 @@ extern "C" fn on_autostart(_this: Id, _cmd: Sel, _sender: Id) {
     if let Err(e) = super::autostart::set_enabled(on) {
         eprintln!("SONdpi: başlangıç ayarı değiştirilemedi: {e}");
     }
-    refresh(true);
+    with_pool(|| refresh(true));
 }
 
 extern "C" fn on_mascot(_this: Id, _cmd: Sel, _sender: Id) {
@@ -138,7 +177,34 @@ extern "C" fn on_mascot(_this: Id, _cmd: Sel, _sender: Id) {
         let on = !c.view().mascot;
         c.set_mascot(on);
     }
-    refresh(true);
+    with_pool(|| refresh(true));
+}
+
+extern "C" fn on_uninstall(_this: Id, _cmd: Sel, _sender: Id) {
+    with_pool(|| {
+        if !confirm(
+            "SONdpi bu Mac'ten kaldırılsın mı?",
+            "Proxy ayarı eski hâline döner, ayarlar silinir ve uygulama Çöp Sepeti'ne taşınır.",
+            "Kaldır",
+        ) {
+            return;
+        }
+        if let Some(c) = core() {
+            c.shutdown(Duration::from_secs(15));
+        }
+        let _ = super::autostart::set_enabled(false);
+        let _ = std::fs::remove_dir_all(core::support_dir());
+        if let Some(app) = std::env::current_exe().ok().and_then(|e| super::autostart::bundle_of(&e)) {
+            // SAFETY: NSFileManager/NSURL calls with valid objects; errors are ignored (null
+            // out-pointers are allowed).
+            unsafe {
+                let fm: Id = send0(class("NSFileManager"), "defaultManager");
+                let url: Id = send1(class("NSURL"), "fileURLWithPath:", nsstring(&app.display().to_string()));
+                let _: bool = send3(fm, "trashItemAtURL:resultingItemURL:error:", url, std::ptr::null_mut::<Id>(), std::ptr::null_mut::<Id>());
+            }
+        }
+        std::process::exit(0);
+    });
 }
 
 extern "C" fn on_quit(_this: Id, _cmd: Sel, _sender: Id) {
@@ -153,20 +219,33 @@ extern "C" fn on_tick(_this: Id, _cmd: Sel, _timer: Id) {
     with_pool(|| refresh(false));
 }
 
+/// NSMenuDelegate: redraw just before the menu shows.
+extern "C" fn menu_will_open(_this: Id, _cmd: Sel, _menu: Id) {
+    with_pool(|| refresh(true));
+}
+
 extern "C" fn will_terminate(_this: Id, _cmd: Sel, _note: Id) {
     if let Some(c) = core() {
         c.shutdown(Duration::from_secs(15));
     }
 }
 
-fn toggle() {
-    if let Some(c) = core() {
-        let v = c.view();
-        if !v.busy {
-            c.set_enabled(!v.enabled);
-        }
+/// A modal yes/no alert; true for the first button.
+fn confirm(message: &str, info: &str, yes: &str) -> bool {
+    // SAFETY: NSAlert on the main thread with valid strings; the app is brought forward so the
+    // alert is not hidden behind other windows (an accessory app has none of its own).
+    unsafe {
+        let app: Id = send0(class("NSApplication"), "sharedApplication");
+        send1::<bool, ()>(app, "activateIgnoringOtherApps:", true);
+        let a: Id = send0(send0::<Id>(class("NSAlert"), "alloc"), "init");
+        send1::<Id, ()>(a, "setMessageText:", nsstring(message));
+        send1::<Id, ()>(a, "setInformativeText:", nsstring(info));
+        let _: Id = send1(a, "addButtonWithTitle:", nsstring(yes));
+        let _: Id = send1(a, "addButtonWithTitle:", nsstring("Vazgeç"));
+        let r: isize = send0(a, "runModal");
+        let _: () = send0(a, "release");
+        r == NS_ALERT_FIRST_BUTTON
     }
-    refresh(true);
 }
 
 // ---- building and redrawing -----------------------------------------------------------------
@@ -213,36 +292,56 @@ fn menu_item(menu: Id, target: Id, title: &str, action: Option<&str>) -> Id {
     }
 }
 
-fn separator(menu: Id) {
-    // SAFETY: separatorItem is an autoreleased item the menu retains.
+fn separator(menu: Id) -> Id {
+    // SAFETY: separatorItem is autoreleased; the menu retains it and so do we.
     unsafe {
         let s: Id = send0(class("NSMenuItem"), "separatorItem");
+        let _: Id = send0(s, "retain");
         send1::<Id, ()>(menu, "addItem:", s);
+        s
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct NSRange {
-    location: usize,
-    length: usize,
+fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+    NSRect { x, y, w, h }
 }
 
-/// "SONdpi" in bold over the state line.
-fn header_title(line: &str) -> Id {
-    let text = format!("SONdpi\n{line}");
-    // SAFETY: attributed-string construction with valid objects; ranges are in UTF-16 units and
-    // inside the string.
+/// A centred, non-editable label.
+fn label(font: Id, frame: NSRect) -> Id {
+    // SAFETY: labelWithString: (macOS 10.12+) returns an autoreleased text field; the caller
+    // adds it to a view, which retains it.
     unsafe {
-        let s: Id = send0(class("NSMutableAttributedString"), "alloc");
-        let s: Id = send1(s, "initWithString:", nsstring(&text));
+        let l: Id = send1(class("NSTextField"), "labelWithString:", nsstring(""));
+        send1::<NSRect, ()>(l, "setFrame:", frame);
+        send1::<Id, ()>(l, "setFont:", font);
+        send1::<isize, ()>(l, "setAlignment:", NS_TEXT_ALIGNMENT_CENTER);
+        send1::<usize, ()>(l, "setAutoresizingMask:", NS_VIEW_WIDTH_SIZABLE);
+        l
+    }
+}
+
+/// The header view: portrait, "SONdpi", state line, laid out like the Windows owner-drawn item.
+/// Returns (view, image view, state label).
+fn header_view() -> (Id, Id, Id) {
+    // SAFETY: view construction on the main thread; subviews are retained by their superview,
+    // the header view by its menu item (and by us via alloc/init).
+    unsafe {
+        let v: Id = send1(send0::<Id>(class("NSView"), "alloc"), "initWithFrame:", rect(0.0, 0.0, HEADER_W, HEADER_H));
+        send1::<usize, ()>(v, "setAutoresizingMask:", NS_VIEW_WIDTH_SIZABLE);
+        let img: Id = send1(send0::<Id>(class("NSImageView"), "alloc"), "initWithFrame:", rect((HEADER_W - PORTRAIT_PT) / 2.0, HEADER_H - 14.0 - PORTRAIT_PT, PORTRAIT_PT, PORTRAIT_PT));
+        send1::<usize, ()>(img, "setAutoresizingMask:", NS_VIEW_MIN_X_MARGIN | NS_VIEW_MAX_X_MARGIN);
+        send1::<Id, ()>(v, "addSubview:", img);
+        let menu_size: f64 = send0(class("NSFont"), "systemFontSize");
+        let bold: Id = send1(class("NSFont"), "boldSystemFontOfSize:", menu_size);
         let regular: Id = send1(class("NSFont"), "menuFontOfSize:", 0.0f64);
-        let bold: Id = send1(class("NSFont"), "boldSystemFontOfSize:", 15.0f64);
-        let all = NSRange { location: 0, length: text.encode_utf16().count() };
-        send3::<Id, Id, NSRange, ()>(s, "addAttribute:value:range:", NSFontAttributeName, regular, all);
-        send3::<Id, Id, NSRange, ()>(s, "addAttribute:value:range:", NSFontAttributeName, bold, NSRange { location: 0, length: 6 });
-        let _: Id = send0(s, "autorelease");
-        s
+        let title_y = HEADER_H - (14.0 + PORTRAIT_PT + 6.0) - TITLE_H;
+        let title = label(bold, rect(0.0, title_y, HEADER_W, TITLE_H));
+        send1::<Id, ()>(title, "setStringValue:", nsstring("SONdpi"));
+        send1::<Id, ()>(title, "setTextColor:", send0::<Id>(class("NSColor"), "labelColor"));
+        send1::<Id, ()>(v, "addSubview:", title);
+        let state = label(regular, rect(0.0, title_y - 1.0 - LINE_H, HEADER_W, LINE_H));
+        send1::<Id, ()>(v, "addSubview:", state);
+        (v, img, state)
     }
 }
 
@@ -257,29 +356,35 @@ fn build(target: Id) -> Ui {
         let menu: Id = send0(class("NSMenu"), "alloc");
         let menu: Id = send1(menu, "initWithTitle:", nsstring("SONdpi"));
         send1::<bool, ()>(menu, "setAutoenablesItems:", false);
+        send1::<Id, ()>(menu, "setDelegate:", target);
 
-        // Clicking the mascot header flips the switch, as on Windows.
-        let header = menu_item(menu, target, "SONdpi", Some("toggle:"));
-        separator(menu);
+        // As tray::menu_entries.
+        let header = menu_item(menu, target, "SONdpi", None);
+        let (hv, portrait, state) = header_view();
+        send1::<Id, ()>(header, "setView:", hv);
+        let header_sep = separator(menu);
         let toggle = menu_item(menu, target, "Açık", Some("toggle:"));
-        let error = menu_item(menu, target, "", None);
-        separator(menu);
         let stats = [
-            menu_item(menu, target, "Korunan bağlantı: 0", None),
-            menu_item(menu, target, "Kurtarılan bağlantı: 0", None),
-            menu_item(menu, target, "DNS yanıtı: 0", None),
+            menu_item(menu, target, "Korunan bağlantı: –", None),
+            menu_item(menu, target, "Kurtarılan bağlantı: –", None),
+            menu_item(menu, target, "DNS yanıtı: –", None),
         ];
+        let error = menu_item(menu, target, "", None);
         separator(menu);
         let autostart = menu_item(menu, target, "Mac açılışında başlat", Some("autostart:"));
         let mascot = menu_item(menu, target, "Maskot simgesi", Some("mascot:"));
+        menu_item(menu, target, "SONdpi'yi kaldır…", Some("uninstall:"));
         separator(menu);
         menu_item(menu, target, "Çıkış", Some("quit:"));
-        // Every click opens it.
+        // On macOS a left click opens it (the only difference from the Windows tray).
         send1::<Id, ()>(item, "setMenu:", menu);
 
         Ui {
             item,
             header,
+            header_sep,
+            portrait,
+            state,
             toggle,
             error,
             stats,
@@ -302,32 +407,35 @@ fn refresh(force: bool) {
         if !force && ui.shown.as_ref() == Some(&v) {
             return;
         }
-        let k = look(&v) as usize;
-        // SAFETY: all objects are retained by `Ui`; strings are autoreleased inside the pool of
-        // the calling callback (or the run loop's).
+        let l = look(&v);
+        let k = l as usize;
+        // SAFETY: all objects are retained by `Ui`; strings and colours are autoreleased inside
+        // the caller's pool.
         unsafe {
             let button: Id = send0(ui.item, "button");
             let icon = if v.mascot { ui.icons[k] } else { ui.symbols[k] };
             send1::<Id, ()>(button, "setImage:", icon);
             send1::<Id, ()>(button, "setToolTip:", nsstring(&tooltip(&v)));
 
-            send1::<Id, ()>(ui.header, "setImage:", if v.mascot { ui.portraits[k] } else { NIL });
-            send1::<Id, ()>(ui.header, "setAttributedTitle:", header_title(state_line(&v)));
+            send1::<bool, ()>(ui.header, "setHidden:", !v.mascot);
+            send1::<bool, ()>(ui.header_sep, "setHidden:", !v.mascot);
+            send1::<Id, ()>(ui.portrait, "setImage:", ui.portraits[k]);
+            send1::<Id, ()>(ui.state, "setStringValue:", nsstring(state_line(l)));
+            let (r, g, b) = state_line_color(l);
+            let color: Id = send4(class("NSColor"), "colorWithSRGBRed:green:blue:alpha:", r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0, 1.0f64);
+            send1::<Id, ()>(ui.state, "setTextColor:", color);
+
             send1::<isize, ()>(ui.toggle, "setState:", v.enabled as isize);
             send1::<bool, ()>(ui.toggle, "setEnabled:", !v.busy);
-            send1::<bool, ()>(ui.header, "setEnabled:", !v.busy);
+            for (i, t) in counter_lines(&v).iter().enumerate() {
+                send1::<Id, ()>(ui.stats[i], "setTitle:", nsstring(t));
+            }
             match &v.error {
                 Some(e) => {
                     send1::<Id, ()>(ui.error, "setTitle:", nsstring(e));
                     send1::<bool, ()>(ui.error, "setHidden:", false);
                 }
                 None => send1::<bool, ()>(ui.error, "setHidden:", true),
-            }
-            let on = v.enabled && v.active;
-            let nums = [v.stats.desynced, v.stats.rescued, v.stats.dns_answered];
-            for (i, (label, n)) in ["Korunan bağlantı", "Kurtarılan bağlantı", "DNS yanıtı"].iter().zip(nums).enumerate() {
-                let t = if on { format!("{label}: {n}") } else { format!("{label}: -") };
-                send1::<Id, ()>(ui.stats[i], "setTitle:", nsstring(&t));
             }
             send1::<isize, ()>(ui.autostart, "setState:", v.autostart as isize);
             send1::<isize, ()>(ui.mascot, "setState:", v.mascot as isize);
@@ -409,11 +517,13 @@ pub fn run() -> i32 {
     let _ = CORE.set(c.clone());
     install_signals(c);
 
-    let methods: [(&str, *const c_void, &str); 6] = [
+    let methods: [(&str, *const c_void, &str); 8] = [
         ("toggle:", on_toggle as *const c_void, "v@:@"),
         ("autostart:", on_autostart as *const c_void, "v@:@"),
         ("mascot:", on_mascot as *const c_void, "v@:@"),
+        ("uninstall:", on_uninstall as *const c_void, "v@:@"),
         ("quit:", on_quit as *const c_void, "v@:@"),
+        ("menuWillOpen:", menu_will_open as *const c_void, "v@:@"),
         ("tick:", on_tick as *const c_void, "v@:@"),
         ("applicationWillTerminate:", will_terminate as *const c_void, "v@:@"),
     ];
@@ -452,25 +562,29 @@ mod tests {
             busy,
             error: error.map(String::from),
             stats: ProxyStats { desynced, ..ProxyStats::default() },
+            has_stats: active,
             mascot: true,
             autostart: false,
         }
     }
 
     #[test]
-    fn looks_and_texts() {
+    fn looks_and_texts_match_the_windows_tray() {
         assert_eq!(look(&v(false, false, false, None, 0)), Look::Off);
         assert_eq!(look(&v(true, true, false, None, 0)), Look::On);
         assert_eq!(look(&v(true, false, false, None, 0)), Look::Problem);
         assert_eq!(look(&v(true, false, true, None, 0)), Look::On); // switching on
         assert_eq!(look(&v(false, false, false, Some("x"), 0)), Look::Problem);
         assert_eq!(tooltip(&v(true, true, false, None, 0)), "SONdpi: açık, hazır");
-        assert!(tooltip(&v(true, true, false, None, 5)).starts_with("SONdpi: açık, 5 bağlantı korundu"));
-        assert!(tooltip(&v(false, false, false, None, 0)).starts_with("SONdpi: kapalı"));
-        assert!(tooltip(&v(false, false, false, Some("Açılamadı: x"), 0)).starts_with("SONdpi: sorun, Açılamadı: x"));
-        assert!(tooltip(&v(true, false, true, None, 0)).starts_with("SONdpi: değiştiriliyor"));
-        assert_eq!(state_line(&v(true, true, false, None, 0)), "Açık");
-        assert_eq!(state_line(&v(false, false, false, None, 0)), "Kapalı");
-        assert_eq!(state_line(&v(true, false, false, None, 0)), "Sorun var");
+        assert_eq!(tooltip(&v(true, true, false, None, 5)), "SONdpi: açık, 5 bağlantı korundu");
+        assert_eq!(tooltip(&v(false, false, false, None, 0)), "SONdpi: kapalı");
+        assert_eq!(tooltip(&v(true, false, false, None, 0)), "SONdpi: açık ama motor çalışmıyor");
+        assert_eq!(tooltip(&v(false, false, false, Some("Açılamadı: x"), 0)), "SONdpi: sorun, Açılamadı: x");
+        assert_eq!(state_line(Look::On), "Açık");
+        assert_eq!(state_line(Look::Off), "Kapalı");
+        assert_eq!(state_line(Look::Problem), "Sorun var");
+        assert_eq!(state_line_color(Look::On), (36, 168, 96));
+        assert_eq!(counter_lines(&v(true, true, false, None, 3))[0], "Korunan bağlantı: 3");
+        assert_eq!(counter_lines(&v(false, false, false, None, 0))[2], "DNS yanıtı: –");
     }
 }

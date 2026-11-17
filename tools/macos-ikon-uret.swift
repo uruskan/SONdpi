@@ -1,7 +1,7 @@
 // macOS simgelerini assets/icons/src/*.svg çizimlerinden üretir (tek seferlik; sonuçlar commit'lenir).
 // Kullanım (repo kökünde): swiftc -O tools/macos-ikon-uret.swift -o /tmp/ikon && /tmp/ikon
 //   assets/macos/{acik,kapali,sorun}.png         menü çubuğu, 36 px (18 pt @2x)
-//   assets/macos/{acik,kapali,sorun}-portre.png  menü başlığı, 128 px (64 pt @2x)
+//   assets/macos/{acik,kapali,sorun}-portre.png  menü başlığı, 256 px (128 pt @2x, Windows menüsündeki boyut)
 //   assets/macos/SONdpi.icns                      uygulama simgesi (iconutil ile)
 import AppKit
 
@@ -24,7 +24,7 @@ let dst = "assets/macos"
 try! FileManager.default.createDirectory(atPath: dst, withIntermediateDirectories: true)
 for s in ["acik", "kapali", "sorun"] {
     render("\(src)/\(s)-kucuk.svg", 36, "\(dst)/\(s).png")
-    render("\(src)/\(s)-portre.svg", 128, "\(dst)/\(s)-portre.png")
+    render("\(src)/\(s)-portre.svg", 256, "\(dst)/\(s)-portre.png")
 }
 let iconset = NSTemporaryDirectory() + "SONdpi.iconset"
 try? FileManager.default.removeItem(atPath: iconset)

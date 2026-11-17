@@ -254,6 +254,50 @@ pub fn is_server_reply(payload: &[u8]) -> bool {
     record_header(payload, REC_ALERT) && u16::from_be_bytes([payload[3], payload[4]]) >= 2
 }
 
+/// Total length (header included) of the TLS handshake record that starts `buf`, when `buf`
+/// begins with a handshake record header. The record may not be complete in `buf` yet.
+pub fn handshake_record_len(buf: &[u8]) -> Option<usize> {
+    if !record_header(buf, REC_HANDSHAKE) {
+        return None;
+    }
+    Some(5 + u16::from_be_bytes([buf[3], buf[4]]) as usize)
+}
+
+/// Where to cut a complete ClientHello record so that neither part holds the whole server
+/// name: the payload offset (bytes after the 5-byte header) of the middle of the SNI. `None`
+/// when `record` is not a ClientHello or carries no server name (nothing to hide).
+pub fn sni_cut(record: &[u8]) -> Option<usize> {
+    let sni = parse_client_hello(record)?.sni?;
+    let payload_len = handshake_record_len(record)?.min(record.len()) - 5;
+    // `sni` is in record coordinates and non-empty; the middle is at least 1 past its start,
+    // which is past the header, so `at >= 1`.
+    let at = (sni.start + sni.end) / 2 - 5;
+    (at >= 1 && at < payload_len).then_some(at)
+}
+
+/// Re-frame one complete TLS record as two records of the same type and version, the first
+/// carrying `at` bytes of the payload and the second the rest. Handshake messages may span
+/// records (RFC 8446 5.1), so the server sees the same ClientHello; a DPI that reads only
+/// the first record does not see the whole name. `None` unless `record` is exactly one
+/// complete record and `0 < at < payload length`.
+pub fn split_record(record: &[u8], at: usize) -> Option<Vec<u8>> {
+    if record.len() < 5 || record[1] != 0x03 {
+        return None;
+    }
+    let len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    if record.len() != 5 + len || at == 0 || at >= len {
+        return None;
+    }
+    let (a, b) = record[5..].split_at(at);
+    let mut out = Vec::with_capacity(record.len() + 5);
+    for part in [a, b] {
+        out.extend_from_slice(&record[..3]);
+        out.extend_from_slice(&(part.len() as u16).to_be_bytes());
+        out.extend_from_slice(part);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +496,60 @@ mod tests {
         assert!(!is_server_reply(&[0x16, 0x03]));
         assert!(!is_server_reply(b"HTTP/1.1 200 OK"));
         assert!(!is_server_reply(&build_client_hello("x.y", 1)));
+    }
+
+    #[test]
+    fn record_len_and_cut() {
+        let h = build_client_hello("discord.com", 7);
+        assert_eq!(handshake_record_len(&h), Some(h.len()));
+        assert_eq!(handshake_record_len(&h[..5]), Some(h.len()));
+        assert_eq!(handshake_record_len(&h[..4]), None);
+        assert_eq!(handshake_record_len(b"GET / HTTP/1.1"), None);
+        let at = sni_cut(&h).unwrap();
+        let sni = parse_client_hello(&h).unwrap().sni.unwrap();
+        assert!(sni.start - 5 < at && at < sni.end - 5, "cut {at} not inside {sni:?}");
+        // no server name, not a ClientHello
+        assert_eq!(sni_cut(&build_client_hello("", 7)), None);
+        assert_eq!(sni_cut(&[0x17, 0x03, 0x03, 0, 1, 0]), None);
+        assert_eq!(sni_cut(&real_world_hello()).map(|a| a > 0), Some(true));
+    }
+
+    #[test]
+    fn split_record_reassembles() {
+        for host in ["discord.com", "a.b", "gateway.discord.gg"] {
+            let h = build_client_hello(host, 3);
+            let at = sni_cut(&h).unwrap();
+            let two = split_record(&h, at).unwrap();
+            assert_eq!(two.len(), h.len() + 5);
+            // first record
+            let l1 = handshake_record_len(&two).unwrap();
+            assert_eq!(l1, 5 + at);
+            let (r1, r2) = two.split_at(l1);
+            assert_eq!(&r1[..3], &h[..3]);
+            assert_eq!(handshake_record_len(r2), Some(r2.len()));
+            // payloads concatenate to the original payload
+            let mut joined = r1[5..].to_vec();
+            joined.extend_from_slice(&r2[5..]);
+            assert_eq!(joined, h[5..].to_vec());
+            // neither record holds the whole name
+            assert!(!r1.windows(host.len()).any(|w| w == host.as_bytes()));
+            assert!(!r2.windows(host.len()).any(|w| w == host.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn split_record_rejects_bad_input() {
+        let h = build_client_hello("discord.com", 3);
+        let n = h.len() - 5;
+        assert!(split_record(&h, 0).is_none());
+        assert!(split_record(&h, n).is_none());
+        assert!(split_record(&h, 1).is_some());
+        assert!(split_record(&h, n - 1).is_some());
+        assert!(split_record(&h[..h.len() - 1], 10).is_none()); // incomplete
+        let mut extra = h.clone();
+        extra.push(0x16);
+        assert!(split_record(&extra, 10).is_none()); // more than one record
+        assert!(split_record(&[0x16, 0x03], 1).is_none());
+        assert!(split_record(&[0x16, 0x02, 0x00, 0x00, 0x02, 1, 2], 1).is_none());
     }
 }

@@ -37,6 +37,8 @@ pub mod redial;
 
 pub mod dns;
 
+pub mod proxy;
+
 #[cfg(windows)]
 pub mod divert;
 #[cfg(windows)]

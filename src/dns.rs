@@ -346,6 +346,65 @@ pub fn set_id(msg: &mut [u8], id: u16) {
     }
 }
 
+/// Record types the proxy resolves.
+pub const TYPE_A: u16 = 1;
+pub const TYPE_AAAA: u16 = 28;
+
+/// A recursive query (RD set, class IN, no EDNS) for `name` and `qtype`. `None` when `name`
+/// is not a valid host name (empty label, label over 63 bytes, name over 253 bytes).
+pub fn build_query(name: &str, qtype: u16, id: u16) -> Option<Vec<u8>> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() || name.len() > 253 {
+        return None;
+    }
+    let mut q = Vec::with_capacity(18 + name.len());
+    q.extend_from_slice(&id.to_be_bytes());
+    q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&[0, 1]);
+    Some(q)
+}
+
+/// Addresses in the answer section (A and AAAA records, in order; CNAMEs are skipped since
+/// recursive resolvers put the whole chain in the answer). Empty for errors and malformed
+/// messages.
+pub fn answer_addrs(resp: &[u8]) -> Vec<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    if resp.len() < 12 || resp[2] & 0x80 == 0 || resp[3] & 0x0f != 0 {
+        return Vec::new();
+    }
+    let Some(rrs) = records(resp) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (sec, rr) in rrs {
+        // rdata follows the TTL (4 bytes) and RDLENGTH (2 bytes)
+        let Some(rdata) = resp.get(rr.ttl_pos + 6..rr.next) else { continue };
+        if sec != 0 {
+            continue;
+        }
+        let ip = match (rr.ty, rdata.len()) {
+            (TYPE_A, 4) => IpAddr::V4(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3])),
+            (TYPE_AAAA, 16) => {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(rdata);
+                IpAddr::V6(Ipv6Addr::from(b))
+            }
+            _ => continue,
+        };
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 /// Shorten a response that does not fit in `limit` bytes: header plus question, TC set.
 fn truncate_for_udp(resp: &mut Vec<u8>, limit: usize) {
     if resp.len() <= limit {
@@ -1330,5 +1389,58 @@ mod tests {
                 age_ttls(&mut m, 5);
             }
         }
+    }
+
+    #[test]
+    fn query_builder() {
+        let q = build_query("discord.com.", TYPE_AAAA, 0xabcd).unwrap();
+        assert_eq!(&q[..2], &[0xab, 0xcd]);
+        let pq = parse_query(&q).unwrap();
+        assert_eq!(pq.qtype, TYPE_AAAA);
+        assert_eq!(pq.labels, vec![b"discord".to_vec(), b"com".to_vec()]);
+        assert!(build_query("", TYPE_A, 1).is_none());
+        assert!(build_query("a..b", TYPE_A, 1).is_none());
+        assert!(build_query(&"x".repeat(64), TYPE_A, 1).is_none());
+        assert!(build_query(&["a"; 130].join("."), TYPE_A, 1).is_none());
+        assert!(build_query("localhost", TYPE_A, 1).is_some());
+    }
+
+    /// Response to `q`: answer records given as (type, rdata), CNAME first when `cname`.
+    fn response(q: &[u8], rcode: u8, answers: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut r = q.to_vec();
+        r[2] |= 0x80;
+        r[3] = 0x80 | rcode;
+        r[6..8].copy_from_slice(&(answers.len() as u16).to_be_bytes());
+        for (ty, rdata) in answers {
+            r.extend_from_slice(&[0xc0, 0x0c]);
+            r.extend_from_slice(&ty.to_be_bytes());
+            r.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+            r.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            r.extend_from_slice(rdata);
+        }
+        r
+    }
+
+    #[test]
+    fn answer_addresses() {
+        let q = build_query("discord.com", TYPE_A, 7).unwrap();
+        let cname = vec![1, b'x', 0];
+        let r = response(
+            &q,
+            0,
+            &[(5, cname), (TYPE_A, vec![162, 159, 135, 232]), (TYPE_A, vec![162, 159, 136, 232]), (TYPE_A, vec![162, 159, 135, 232])],
+        );
+        let a = answer_addrs(&r);
+        assert_eq!(a, vec!["162.159.135.232".parse::<std::net::IpAddr>().unwrap(), "162.159.136.232".parse().unwrap()]);
+        let mut v6 = vec![0x26, 0x06, 0x47, 0x00];
+        v6.extend_from_slice(&[0; 11]);
+        v6.push(1);
+        let r6 = response(&q, 0, &[(TYPE_AAAA, v6)]);
+        assert_eq!(answer_addrs(&r6), vec!["2606:4700::1".parse::<std::net::IpAddr>().unwrap()]);
+        // NXDOMAIN, query instead of response, truncated, wrong rdata length
+        assert!(answer_addrs(&response(&q, 3, &[])).is_empty());
+        assert!(answer_addrs(&q).is_empty());
+        assert!(answer_addrs(&r[..r.len() - 2]).is_empty());
+        assert!(answer_addrs(&response(&q, 0, &[(TYPE_A, vec![1, 2, 3])])).is_empty());
     }
 }

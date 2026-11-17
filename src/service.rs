@@ -17,14 +17,22 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use windows_sys::core::PWSTR;
-use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR, TRUE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR, TRUE};
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTSQueryUserToken, WTS_CURRENT_SERVER_HANDLE,
+    WTS_SESSION_INFOW,
+};
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
-    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE,
-    SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING,
-    SERVICE_STATUS, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
-    SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
+    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_SHUTDOWN,
+    SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOPPED,
+    SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// How long the engine may take to shut down before the service reports stopped anyway.
@@ -229,6 +237,109 @@ impl EngineControl for MockControl {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Tray at logon
+// ---------------------------------------------------------------------------------------------
+//
+// Windows does not always run the HKCU Run entry at logon (seen 2026-11-16: the Run pass ran no
+// command at all), so the service also starts the tray in every new user session. The tray
+// checks the user's own "start with Windows" choice and exits if it is off; its single-instance
+// mutex makes a second start (Run entry and service both firing) harmless.
+
+/// `WTS_SESSION_LOGON` from the session-change notification.
+const WTS_SESSION_LOGON: u32 = 5;
+
+/// Payload of `SERVICE_CONTROL_SESSIONCHANGE` (`WTSSESSION_NOTIFICATION`).
+#[repr(C)]
+struct SessionNotification {
+    cb_size: u32,
+    session_id: u32,
+}
+
+/// Command line the service uses to start the tray in a user session.
+pub fn tray_command(exe: &std::path::Path) -> String {
+    format!("\"{}\" --autostart", exe.display())
+}
+
+/// Start the tray as the user logged on to `session` (unelevated, on their desktop).
+fn launch_tray(session: u32) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let mut token: HANDLE = null_mut();
+    // SAFETY: valid out pointer; LocalSystem holds the privilege this needs.
+    if unsafe { WTSQueryUserToken(session, &mut token) } == 0 {
+        // SAFETY: trivial.
+        return Err(format!("oturum belirteci alınamadı ({})", unsafe { GetLastError() }));
+    }
+    let mut env: *mut c_void = null_mut();
+    // SAFETY: valid token and out pointer; on failure env stays null and the child inherits ours.
+    let have_env = unsafe { CreateEnvironmentBlock(&mut env, token, 0) } != 0;
+    let mut cmd = wide(&tray_command(&exe));
+    let cwd = wide(&dir.to_string_lossy());
+    let mut desktop = wide("winsta0\\default");
+    // SAFETY: all-zero is a valid STARTUPINFOW; fields set below.
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    si.lpDesktop = desktop.as_mut_ptr();
+    // SAFETY: all-zero is a valid PROCESS_INFORMATION (an out parameter).
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is valid for the call; cmd is a mutable NUL-terminated buffer.
+    let ok = unsafe {
+        CreateProcessAsUserW(
+            token,
+            null(),
+            cmd.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_UNICODE_ENVIRONMENT,
+            if have_env { env } else { null_mut() },
+            cwd.as_ptr(),
+            &si,
+            &mut pi,
+        )
+    } != 0;
+    // SAFETY: trivial.
+    let err = unsafe { GetLastError() };
+    // SAFETY: handles and block were created above and are released exactly once.
+    unsafe {
+        if have_env {
+            DestroyEnvironmentBlock(env);
+        }
+        if ok {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+        CloseHandle(token);
+    }
+    if ok { Ok(()) } else { Err(format!("tepsi başlatılamadı ({err})")) }
+}
+
+fn launch_tray_logged(session: u32) {
+    let _ = std::thread::Builder::new().name("sondpi-tray-launch".into()).spawn(move || {
+        if let Err(e) = launch_tray(session) {
+            log(&format!("oturum {session}: {e}"));
+        }
+    });
+}
+
+/// Sessions with a user at the desktop right now (a service restart or upgrade happens while
+/// someone is logged on).
+fn active_sessions() -> Vec<u32> {
+    let mut info: *mut WTS_SESSION_INFOW = null_mut();
+    let mut count = 0u32;
+    // SAFETY: valid out pointers; the array is freed below.
+    if unsafe { WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut info, &mut count) } == 0 {
+        return vec![];
+    }
+    // SAFETY: the call succeeded, so info points to `count` entries.
+    let list = unsafe { std::slice::from_raw_parts(info, count as usize) };
+    let out = list.iter().filter(|s| s.SessionId != 0 && s.State == WTSActive).map(|s| s.SessionId).collect();
+    // SAFETY: allocated by WTSEnumerateSessionsW.
+    unsafe { WTSFreeMemory(info as *mut c_void) };
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
 // Hosting
 // ---------------------------------------------------------------------------------------------
 
@@ -300,7 +411,11 @@ fn report(state: u32, exit_code: u32, wait_hint: u32) {
     let st = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,
-        dwControlsAccepted: if state == SERVICE_RUNNING { SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN } else { 0 },
+        dwControlsAccepted: if state == SERVICE_RUNNING {
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE
+        } else {
+            0
+        },
         dwWin32ExitCode: exit_code,
         dwServiceSpecificExitCode: 0,
         dwCheckPoint: if pending { CHECKPOINT.fetch_add(1, Ordering::SeqCst) + 1 } else { 0 },
@@ -310,8 +425,18 @@ fn report(state: u32, exit_code: u32, wait_hint: u32) {
     unsafe { SetServiceStatus(h as _, &st) };
 }
 
-unsafe extern "system" fn control_handler(control: u32, _event: u32, _data: *mut c_void, _ctx: *mut c_void) -> u32 {
+unsafe extern "system" fn control_handler(control: u32, event: u32, data: *mut c_void, _ctx: *mut c_void) -> u32 {
     match control {
+        SERVICE_CONTROL_SESSIONCHANGE => {
+            if event == WTS_SESSION_LOGON && !data.is_null() {
+                // SAFETY: for SESSIONCHANGE the SCM passes a WTSSESSION_NOTIFICATION.
+                let n = unsafe { &*(data as *const SessionNotification) };
+                if n.cb_size as usize >= std::mem::size_of::<SessionNotification>() {
+                    launch_tray_logged(n.session_id);
+                }
+            }
+            NO_ERROR
+        }
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
             report(SERVICE_STOP_PENDING, 0, 30_000);
             if let Some(s) = STOP.get() {
@@ -343,7 +468,12 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     };
     let code = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let ctl = real_or_mock(false, false);
-        host(ctl, stop, || report(SERVICE_RUNNING, 0, 0))
+        host(ctl, stop, || {
+            report(SERVICE_RUNNING, 0, 0);
+            for s in active_sessions() {
+                launch_tray_logged(s);
+            }
+        })
     }))
     .unwrap_or_else(|_| {
         log("servis beklenmedik bir hatayla durdu");
@@ -442,6 +572,12 @@ mod tests {
         off.apply_persisted();
         assert!(!probe.on.load(Ordering::SeqCst));
         assert!(probe.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tray_command_line() {
+        let exe = std::path::Path::new(r"C:\Program Files\SONdpi\sondpi.exe");
+        assert_eq!(tray_command(exe), "\"C:\\Program Files\\SONdpi\\sondpi.exe\" --autostart");
     }
 
     #[test]

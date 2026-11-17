@@ -1153,6 +1153,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_TIMER if wp == TIMER_POLL => {
+            // At logon the shell may refuse the icon before the taskbar is ready; keep trying.
+            let retry = with(|t| {
+                if t.added {
+                    return false;
+                }
+                add_icon(hwnd, t);
+                t.added
+            })
+            .unwrap_or(false);
+            if retry {
+                refresh_ui(hwnd);
+            }
             poll(hwnd);
             0
         }
@@ -1295,7 +1307,13 @@ pub fn run(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("ctl") {
         return run_ctl(&args[1..]);
     }
-    let no_setup = args.iter().any(|a| a == "--no-setup");
+    // `--autostart`: started by the service at logon. The user's "start with Windows" choice
+    // (the HKCU Run entry) decides whether the tray stays.
+    let autostart = args.iter().any(|a| a == "--autostart");
+    if autostart && !install::autostart_enabled() {
+        return 0;
+    }
+    let no_setup = autostart || args.iter().any(|a| a == "--no-setup");
     // A leftover of an earlier upgrade (best effort; needs write access to the install folder).
     install::cleanup_installed_leftovers();
 
